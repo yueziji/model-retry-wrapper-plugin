@@ -76,3 +76,14 @@ Use the platform extension expected by your target system:
 - `.dll` on Windows
 - `.so` on Linux
 - `.dylib` on macOS
+
+## Release
+
+This repository includes a GitHub Actions release workflow. Run `Release` manually and keep the default version `v0.0.1` for the first release, or push a tag such as:
+
+```bash
+git tag v0.0.1
+git push origin v0.0.1
+```
+
+The workflow builds native plugin archives for Windows, Linux, and macOS, then publishes them as GitHub Release assets.
