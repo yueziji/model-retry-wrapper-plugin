@@ -9,6 +9,7 @@ This Go-only plugin demonstrates a small ModelRouter + executor wrapper for retr
 - Routes only explicitly configured client-requested model names or aliases to the plugin executor.
 - Calls the normal host model execution path through `host.model.execute` or `host.model.execute_stream`.
 - Retries configured upstream HTTP status codes in the plugin before returning an error downstream.
+- Can optionally retry configured error-message keywords when the host callback does not include a numeric HTTP status.
 - Skips its own router on nested host model callbacks, so the wrapper does not recurse into itself.
 
 The plugin is intended for explicit retry aliases such as `retry-codex-gpt-5.5` or `retry-claude-sonnet`. Requests for normal model names are left untouched unless those names are listed in `models`.
@@ -28,12 +29,16 @@ plugins:
         - "openai"
         - "claude"
       status_codes: [408, 429, 500, 502, 503, 504]
+      retry_keywords:
+        - "rate_limited"
       max_attempts: 0
       initial_delay_ms: 500
       max_delay_ms: 10000
 ```
 
 `max_attempts` includes the first upstream attempt. `0` means retry until the client cancels the request.
+
+`status_codes` is the primary retry rule. `retry_keywords` is only a fallback for host callback errors that do not expose a numeric HTTP status, such as `rate_limited`; if omitted or saved as an empty list, the default fallback is `rate_limited`.
 
 ## Alias Pattern
 

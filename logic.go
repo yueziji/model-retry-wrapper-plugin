@@ -25,6 +25,7 @@ type pluginConfig struct {
 	Models         []string       `yaml:"models"`
 	SourceFormats  []string       `yaml:"source_formats"`
 	StatusCodes    statusCodeList `yaml:"status_codes"`
+	RetryKeywords  []string       `yaml:"retry_keywords"`
 	MaxAttempts    int            `yaml:"max_attempts"`
 	InitialDelayMS int            `yaml:"initial_delay_ms"`
 	MaxDelayMS     int            `yaml:"max_delay_ms"`
@@ -72,6 +73,7 @@ func configure(raw []byte) error {
 		"models":           cfg.Models,
 		"source_formats":   cfg.SourceFormats,
 		"status_codes":     []int(cfg.StatusCodes),
+		"retry_keywords":   cfg.RetryKeywords,
 		"max_attempts":     cfg.MaxAttempts,
 		"initial_delay_ms": cfg.InitialDelayMS,
 		"max_delay_ms":     cfg.MaxDelayMS,
@@ -84,6 +86,7 @@ func defaultPluginConfig() pluginConfig {
 	return pluginConfig{
 		Enabled:        true,
 		StatusCodes:    []int{408, 429, 500, 502, 503, 504},
+		RetryKeywords:  []string{"rate_limited"},
 		MaxAttempts:    0,
 		InitialDelayMS: 500,
 		MaxDelayMS:     10000,
@@ -98,6 +101,10 @@ func decodeConfig(raw []byte) (pluginConfig, error) {
 	cfg.Models = normalizeStringList(cfg.Models)
 	cfg.SourceFormats = normalizeSourceFormatList(cfg.SourceFormats)
 	cfg.StatusCodes = normalizeStatusCodes(cfg.StatusCodes)
+	cfg.RetryKeywords = normalizeStringList(cfg.RetryKeywords)
+	if len(cfg.RetryKeywords) == 0 {
+		cfg.RetryKeywords = defaultPluginConfig().RetryKeywords
+	}
 	if cfg.InitialDelayMS < 0 {
 		cfg.InitialDelayMS = 0
 	}
@@ -163,6 +170,40 @@ func shouldRetryStatus(cfg pluginConfig, status int) bool {
 		}
 	}
 	return false
+}
+
+func shouldRetryFailure(cfg pluginConfig, attempt int, status int, err error) (bool, string) {
+	if shouldRetryStatus(cfg, status) {
+		return shouldRetryAttempt(cfg, attempt, status), ""
+	}
+	if status > 0 {
+		return false, ""
+	}
+	keyword := retryKeywordFromError(cfg, err)
+	if keyword == "" {
+		return false, ""
+	}
+	if cfg.MaxAttempts == 0 {
+		return true, keyword
+	}
+	return attempt < cfg.MaxAttempts, keyword
+}
+
+func retryKeywordFromError(cfg pluginConfig, err error) string {
+	if err == nil || len(cfg.RetryKeywords) == 0 {
+		return ""
+	}
+	text := normalizeKey(err.Error())
+	if text == "" {
+		return ""
+	}
+	for _, keyword := range cfg.RetryKeywords {
+		keyword = normalizeKey(keyword)
+		if keyword != "" && strings.Contains(text, keyword) {
+			return keyword
+		}
+	}
+	return ""
 }
 
 func retryDelay(cfg pluginConfig, attempt int) time.Duration {

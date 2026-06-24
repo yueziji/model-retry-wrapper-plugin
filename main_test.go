@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"net/http"
 	"reflect"
 	"testing"
@@ -71,6 +72,36 @@ func TestRetryAttemptHonorsConfiguredStatusAndMaxAttempts(t *testing.T) {
 	}
 	if shouldRetryAttempt(cfg, 1, http.StatusBadRequest) {
 		t.Fatal("expected non-configured status to bypass retry")
+	}
+}
+
+func TestRetryFailureUsesConfiguredKeywordWhenStatusMissing(t *testing.T) {
+	cfg := defaultPluginConfig()
+	cfg.MaxAttempts = 3
+	err := errors.New(`host_call_failed: {"error":{"message":"rate_limited (request id: test)","type":"new_api_error","code":"rate_limited"}}`)
+
+	shouldRetry, keyword := shouldRetryFailure(cfg, 1, 0, err)
+	if !shouldRetry {
+		t.Fatal("expected keyword fallback to retry")
+	}
+	if keyword != "rate_limited" {
+		t.Fatalf("keyword = %q, want rate_limited", keyword)
+	}
+
+	shouldRetry, _ = shouldRetryFailure(cfg, 3, 0, err)
+	if shouldRetry {
+		t.Fatal("expected max attempts to stop keyword fallback retry")
+	}
+
+	shouldRetry, keyword = shouldRetryFailure(cfg, 1, http.StatusBadRequest, err)
+	if shouldRetry || keyword != "" {
+		t.Fatalf("status-coded failure retry = %v, keyword = %q; want false, empty", shouldRetry, keyword)
+	}
+
+	cfg.RetryKeywords = []string{"overloaded"}
+	shouldRetry, keyword = shouldRetryFailure(cfg, 1, 0, err)
+	if shouldRetry || keyword != "" {
+		t.Fatalf("non-matching keyword fallback retry = %v, keyword = %q; want false, empty", shouldRetry, keyword)
 	}
 }
 

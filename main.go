@@ -213,6 +213,7 @@ func pluginRegistration() registration {
 				{Name: "models", Type: pluginapi.ConfigFieldTypeArray, Description: "Client-requested model names or aliases wrapped by this retry executor."},
 				{Name: "source_formats", Type: pluginapi.ConfigFieldTypeArray, Description: "Optional inbound protocol filter such as openai, openai-response, claude, or gemini."},
 				{Name: "status_codes", Type: pluginapi.ConfigFieldTypeArray, Description: "HTTP status codes retried inside the plugin before downstream delivery."},
+				{Name: "retry_keywords", Type: pluginapi.ConfigFieldTypeArray, Description: "Fallback error substrings retried when the host callback does not include an HTTP status code."},
 				{Name: "max_attempts", Type: pluginapi.ConfigFieldTypeInteger, Description: "Maximum attempts, including the first try. 0 means retry until the client cancels."},
 				{Name: "initial_delay_ms", Type: pluginapi.ConfigFieldTypeInteger, Description: "Initial delay before a retry."},
 				{Name: "max_delay_ms", Type: pluginapi.ConfigFieldTypeInteger, Description: "Maximum exponential backoff delay."},
@@ -327,6 +328,7 @@ func retryLogFields(req rpcExecutorRequest, cfg pluginConfig, attempt int, statu
 		"retryable_status": shouldRetryStatus(cfg, status),
 		"max_attempts":     cfg.MaxAttempts,
 		"status_codes":     []int(cfg.StatusCodes),
+		"retry_keywords":   cfg.RetryKeywords,
 	}
 }
 
@@ -350,7 +352,11 @@ func runModelExecuteWithRetry(ctx context.Context, req rpcExecutorRequest) (plug
 		if errCall != nil {
 			fields["error"] = shortError(errCall)
 		}
-		if !shouldRetryAttempt(cfg, attempt, status) {
+		shouldRetry, retryKeyword := shouldRetryFailure(cfg, attempt, status, errCall)
+		if retryKeyword != "" {
+			fields["retry_keyword"] = retryKeyword
+		}
+		if !shouldRetry {
 			pluginLog(req.HostCallbackID, "warn", "model-retry-wrapper: retry stopped", fields)
 			return pluginapi.HostModelExecutionResponse{}, lastErr
 		}
@@ -389,7 +395,11 @@ func runModelStreamWithRetry(ctx context.Context, req rpcExecutorRequest) error 
 		if errStart != nil {
 			fields["error"] = shortError(errStart)
 		}
-		if !shouldRetryAttempt(cfg, attempt, status) {
+		shouldRetry, retryKeyword := shouldRetryFailure(cfg, attempt, status, errStart)
+		if retryKeyword != "" {
+			fields["retry_keyword"] = retryKeyword
+		}
+		if !shouldRetry {
 			pluginLog(req.HostCallbackID, "warn", "model-retry-wrapper: stream retry stopped", fields)
 			return lastErr
 		}

@@ -9,6 +9,7 @@
 - 只把显式配置的客户端请求模型名或别名路由到插件执行器。
 - 通过 `host.model.execute` 或 `host.model.execute_stream` 调用常规的宿主模型执行路径。
 - 在错误返回下游之前，由插件重试已配置的上游 HTTP 状态码。
+- 当宿主回调没有暴露数字 HTTP 状态码时，可以按配置的错误关键词做兜底重试。
 - 在嵌套的宿主模型回调中跳过自己的路由器，避免包装器递归调用自身。
 
 该插件适合用于显式的重试别名，例如 `retry-codex-gpt-5.5` 或 `retry-claude-sonnet`。除非普通模型名被列入 `models`，否则针对普通模型名的请求不会被插件处理。
@@ -28,12 +29,16 @@ plugins:
         - "openai"
         - "claude"
       status_codes: [408, 429, 500, 502, 503, 504]
+      retry_keywords:
+        - "rate_limited"
       max_attempts: 0
       initial_delay_ms: 500
       max_delay_ms: 10000
 ```
 
 `max_attempts` 包含第一次上游请求。`0` 表示一直重试，直到客户端取消请求。
+
+`status_codes` 是主要重试规则。`retry_keywords` 只作为兜底，用于宿主回调没有提供数字 HTTP 状态码的错误，例如 `rate_limited`；如果省略该字段，或被 WebUI 保存为空列表，默认兜底关键词仍为 `rate_limited`。
 
 ## 别名模式
 
