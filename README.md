@@ -1,5 +1,7 @@
 # Model Retry Wrapper Plugin
 
+[中文](README.zh-CN.md)
+
 This Go-only plugin demonstrates a small ModelRouter + executor wrapper for retrying selected model aliases inside CPA before an error reaches the downstream client.
 
 ## What It Does
