@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"reflect"
@@ -150,6 +151,24 @@ func TestRetryDelayCapsExponentialBackoff(t *testing.T) {
 	}
 	if got := retryDelay(cfg, 3); got != 1200*time.Millisecond {
 		t.Fatalf("attempt 3 delay = %v, want capped 1.2s", got)
+	}
+}
+
+func TestWaitRetryDelayWithProbeStopsOnProbeError(t *testing.T) {
+	want := errors.New("stream closed")
+	calls := 0
+	err := waitRetryDelayWithProbe(context.Background(), time.Millisecond, func() error {
+		calls++
+		if calls > 1 {
+			return want
+		}
+		return nil
+	})
+	if !errors.Is(err, want) {
+		t.Fatalf("waitRetryDelayWithProbe() error = %v, want %v", err, want)
+	}
+	if calls != 2 {
+		t.Fatalf("probe calls = %d, want 2", calls)
 	}
 }
 

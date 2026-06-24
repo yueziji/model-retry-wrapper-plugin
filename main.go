@@ -58,6 +58,7 @@ import "C"
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -69,7 +70,9 @@ import (
 
 const pluginIdentifier = "model-retry-wrapper"
 
-var pluginVersion = "0.0.6-dev"
+var pluginVersion = "0.0.7-dev"
+
+var errPluginStreamClosed = errors.New("plugin stream closed")
 
 type envelope struct {
 	OK     bool            `json:"ok"`
@@ -301,6 +304,13 @@ func executeStream(raw []byte) ([]byte, error) {
 	go func() {
 		errRun := runModelStreamWithRetry(context.Background(), req)
 		if errRun != nil {
+			if errors.Is(errRun, errPluginStreamClosed) {
+				pluginLog(req.HostCallbackID, "debug", "model-retry-wrapper: stream canceled", map[string]any{
+					"model": req.Model,
+					"error": shortError(errRun),
+				})
+				return
+			}
 			pluginLog(req.HostCallbackID, "warn", "model-retry-wrapper: stream failed", map[string]any{
 				"model": req.Model,
 				"error": shortError(errRun),
@@ -376,6 +386,9 @@ func runModelStreamWithRetry(ctx context.Context, req rpcExecutorRequest) error 
 	pluginLog(req.HostCallbackID, "info", "model-retry-wrapper: stream retry executor start", retryLogFields(req, cfg, 0, 0, true))
 	var lastErr error
 	for attempt := 1; ; attempt++ {
+		if errProbe := probePluginStreamOpen(req.StreamID); errProbe != nil {
+			return errProbe
+		}
 		status, firstPayload, streamID, errStart := startHostModelStream(req)
 		if errStart == nil && !shouldRetryStatus(cfg, status) {
 			fields := retryLogFields(req, cfg, attempt, status, true)
@@ -407,7 +420,9 @@ func runModelStreamWithRetry(ctx context.Context, req rpcExecutorRequest) error 
 		delay := retryDelay(cfg, attempt)
 		fields["delay_ms"] = durationMillis(delay)
 		pluginLog(req.HostCallbackID, "warn", "model-retry-wrapper: retrying stream startup", fields)
-		if errWait := waitRetryDelay(ctx, delay); errWait != nil {
+		if errWait := waitRetryDelayWithProbe(ctx, delay, func() error {
+			return probePluginStreamOpen(req.StreamID)
+		}); errWait != nil {
 			pluginLog(req.HostCallbackID, "warn", "model-retry-wrapper: stream retry wait canceled", logFieldsWith(fields, "error", shortError(errWait)))
 			return errWait
 		}
@@ -539,6 +554,20 @@ func emitPluginStreamChunk(streamID string, payload []byte) error {
 		return fmt.Errorf("plugin stream id is required")
 	}
 	_, errCall := callHost(pluginabi.MethodHostStreamEmit, rpcStreamEmitRequest{StreamID: streamID, Payload: payload})
+	if errCall != nil {
+		return fmt.Errorf("%w: %v", errPluginStreamClosed, errCall)
+	}
+	return nil
+}
+
+func probePluginStreamOpen(streamID string) error {
+	if strings.TrimSpace(streamID) == "" {
+		return nil
+	}
+	_, errCall := callHost(pluginabi.MethodHostStreamEmit, rpcStreamEmitRequest{StreamID: streamID})
+	if errCall != nil {
+		return fmt.Errorf("%w: %v", errPluginStreamClosed, errCall)
+	}
 	return errCall
 }
 

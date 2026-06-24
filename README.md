@@ -16,7 +16,7 @@ The plugin is intended for explicit retry aliases such as `retry-codex-gpt-5.5` 
 
 ## Configuration
 
-Download a `v0.0.6` or newer release asset for your platform, extract the dynamic library, and place it under CPA's plugin directory. The library basename must be `model-retry-wrapper` so CPA maps it to `plugins.configs.model-retry-wrapper`.
+Download a `v0.0.7` or newer release asset for your platform, extract the dynamic library, and place it under CPA's plugin directory. The library basename must be `model-retry-wrapper` so CPA maps it to `plugins.configs.model-retry-wrapper`.
 
 Release archives contain the expected platform filename:
 
@@ -48,7 +48,7 @@ plugins:
       max_delay_ms: 10000
 ```
 
-`max_attempts` includes the first upstream attempt. `0` means no attempt cap; downstream cancellation still stops the request through CPA host callbacks, but cancellation during a backoff sleep is observed on the next host callback, so shutdown can be delayed by up to the current retry delay.
+`max_attempts` includes the first upstream attempt. `0` means no attempt cap. Downstream cancellation stops requests through CPA host callbacks; streaming startup retries also probe the downstream plugin stream during backoff so canceled streams stop instead of continuing the retry loop.
 
 `status_codes` is the primary retry rule. `retry_keywords` is only a fallback for host callback errors that do not expose a numeric HTTP status, such as `rate_limited`; if omitted or saved as an empty list, the default fallback is `rate_limited`.
 
@@ -89,7 +89,7 @@ From this repository root:
 
 ```bash
 go test .
-go build -buildmode=c-shared -ldflags "-X main.pluginVersion=0.0.6" -o model-retry-wrapper.dll .
+go build -buildmode=c-shared -ldflags "-X main.pluginVersion=0.0.7" -o model-retry-wrapper.dll .
 ```
 
 Use the platform extension expected by your target system:
@@ -103,8 +103,8 @@ Use the platform extension expected by your target system:
 This repository includes a GitHub Actions release workflow. Run `Release` manually with the next semver tag, or push a tag such as:
 
 ```bash
-git tag v0.0.6
-git push origin v0.0.6
+git tag v0.0.7
+git push origin v0.0.7
 ```
 
 The workflow runs tests, builds Windows/Linux/macOS dynamic libraries, injects the tag version into plugin metadata, and publishes zip archives as GitHub Release assets.

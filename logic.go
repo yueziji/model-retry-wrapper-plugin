@@ -239,6 +239,34 @@ func waitRetryDelay(ctx context.Context, delay time.Duration) error {
 	}
 }
 
+func waitRetryDelayWithProbe(ctx context.Context, delay time.Duration, probe func() error) error {
+	if probe != nil {
+		if err := probe(); err != nil {
+			return err
+		}
+	}
+	if delay <= 0 {
+		return nil
+	}
+	remaining := delay
+	for remaining > 0 {
+		step := remaining
+		if step > time.Second {
+			step = time.Second
+		}
+		if err := waitRetryDelay(ctx, step); err != nil {
+			return err
+		}
+		remaining -= step
+		if probe != nil {
+			if err := probe(); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 func logFieldsWith(fields map[string]any, key string, value any) map[string]any {
 	next := make(map[string]any, len(fields)+1)
 	for k, v := range fields {
