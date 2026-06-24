@@ -92,5 +92,3 @@ This repository includes a GitHub Actions release workflow. Run `Release` manual
 git tag v0.0.1
 git push origin v0.0.1
 ```
-
-The workflow builds native plugin archives for Windows, Linux, and macOS, then publishes them as GitHub Release assets.
