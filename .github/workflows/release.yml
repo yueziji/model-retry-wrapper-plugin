@@ -9,13 +9,13 @@ on:
       version:
         description: "Release version tag"
         required: true
-        default: "v0.0.1"
+        default: "v0.0.6"
 
 permissions:
   contents: write
 
 env:
-  PLUGIN_NAME: model-retry-wrapper-go
+  PLUGIN_NAME: model-retry-wrapper
 
 jobs:
   test:
@@ -64,9 +64,13 @@ jobs:
 
       - name: Build plugin
         shell: pwsh
+        env:
+          CGO_ENABLED: "1"
         run: |
           New-Item -ItemType Directory -Path "dist" -Force | Out-Null
-          go build -buildmode=c-shared -o "dist/${{ env.PLUGIN_NAME }}.${{ matrix.ext }}" .
+          $version = "${{ github.event_name == 'workflow_dispatch' && inputs.version || github.ref_name }}"
+          $pluginVersion = $version.TrimStart("v")
+          go build -buildmode=c-shared -ldflags "-X main.pluginVersion=$pluginVersion" -o "dist/${{ env.PLUGIN_NAME }}.${{ matrix.ext }}" .
 
       - name: Package plugin
         shell: pwsh
@@ -96,7 +100,7 @@ jobs:
         shell: pwsh
         run: |
           if ("${{ inputs.version }}" -notmatch '^v\d+\.\d+\.\d+([\-+][0-9A-Za-z.-]+)?$') {
-            throw "Version must look like v0.0.1"
+            throw "Version must look like vMAJOR.MINOR.PATCH"
           }
 
       - name: Download artifacts

@@ -20,6 +20,13 @@ func TestShouldRouteMatchesConfiguredModelAlias(t *testing.T) {
 	}
 }
 
+func TestDefaultConfigUsesUnboundedRetryAttempts(t *testing.T) {
+	cfg := defaultPluginConfig()
+	if cfg.MaxAttempts != 0 {
+		t.Fatalf("MaxAttempts = %d, want 0", cfg.MaxAttempts)
+	}
+}
+
 func TestShouldRouteRespectsSourceFormatFilter(t *testing.T) {
 	cfg := defaultPluginConfig()
 	cfg.Models = []string{"retry-claude-sonnet"}

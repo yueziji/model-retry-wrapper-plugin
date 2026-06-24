@@ -1,4 +1,4 @@
-module github.com/router-for-me/model-retry-wrapper-plugin
+module github.com/yueziji/model-retry-wrapper-plugin
 
 go 1.26.0
 
