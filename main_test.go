@@ -32,6 +32,29 @@ func TestShouldRouteRespectsSourceFormatFilter(t *testing.T) {
 	}
 }
 
+func TestShouldRouteMatchesOpenAIResponseSourceFormatAlias(t *testing.T) {
+	cfg, err := decodeConfig([]byte(`
+enabled: true
+models:
+  - gpt-5.5-ly
+source_formats:
+  - responses
+`))
+	if err != nil {
+		t.Fatalf("decodeConfig() error = %v", err)
+	}
+	if !shouldRoute(cfg, "openai-response", "gpt-5.5-ly") {
+		t.Fatal("expected responses alias to match openai-response requests")
+	}
+}
+
+func TestPluginRegistrationSupportsOpenAIResponsesExecutorFormat(t *testing.T) {
+	formats := supportedExecutorFormats()
+	if !stringListContains(formats, "openai-response") {
+		t.Fatalf("supportedExecutorFormats() = %#v, want openai-response", formats)
+	}
+}
+
 func TestRetryAttemptHonorsConfiguredStatusAndMaxAttempts(t *testing.T) {
 	cfg := defaultPluginConfig()
 	cfg.StatusCodes = []int{http.StatusBadGateway}

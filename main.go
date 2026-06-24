@@ -204,7 +204,7 @@ func pluginRegistration() registration {
 			Logo:             "https://raw.githubusercontent.com/router-for-me/CLIProxyAPI/main/docs/logo.png",
 			ConfigFields: []pluginapi.ConfigField{
 				{Name: "models", Type: pluginapi.ConfigFieldTypeArray, Description: "Client-requested model names or aliases wrapped by this retry executor."},
-				{Name: "source_formats", Type: pluginapi.ConfigFieldTypeArray, Description: "Optional inbound protocol filter such as openai, claude, or gemini."},
+				{Name: "source_formats", Type: pluginapi.ConfigFieldTypeArray, Description: "Optional inbound protocol filter such as openai, openai-response, claude, or gemini."},
 				{Name: "status_codes", Type: pluginapi.ConfigFieldTypeArray, Description: "HTTP status codes retried inside the plugin before downstream delivery."},
 				{Name: "max_attempts", Type: pluginapi.ConfigFieldTypeInteger, Description: "Maximum attempts, including the first try. 0 means retry until the client cancels."},
 				{Name: "initial_delay_ms", Type: pluginapi.ConfigFieldTypeInteger, Description: "Initial delay before a retry."},
@@ -215,8 +215,8 @@ func pluginRegistration() registration {
 			ModelRouter:           true,
 			Executor:              true,
 			ExecutorModelScope:    string(pluginapi.ExecutorModelScopeStatic),
-			ExecutorInputFormats:  []string{"openai", "claude", "gemini", "chat-completions"},
-			ExecutorOutputFormats: []string{"openai", "claude", "gemini", "chat-completions"},
+			ExecutorInputFormats:  supportedExecutorFormats(),
+			ExecutorOutputFormats: supportedExecutorFormats(),
 		},
 	}
 }

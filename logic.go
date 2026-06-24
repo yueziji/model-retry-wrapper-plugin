@@ -32,6 +32,10 @@ type pluginConfig struct {
 
 type statusCodeList []int
 
+func supportedExecutorFormats() []string {
+	return []string{"openai", "openai-response", "claude", "gemini", "chat-completions"}
+}
+
 type retryStatusError struct {
 	status int
 	err    error
@@ -82,7 +86,7 @@ func decodeConfig(raw []byte) (pluginConfig, error) {
 		return pluginConfig{}, errUnmarshal
 	}
 	cfg.Models = normalizeStringList(cfg.Models)
-	cfg.SourceFormats = normalizeStringList(cfg.SourceFormats)
+	cfg.SourceFormats = normalizeSourceFormatList(cfg.SourceFormats)
 	cfg.StatusCodes = normalizeStatusCodes(cfg.StatusCodes)
 	if cfg.InitialDelayMS < 0 {
 		cfg.InitialDelayMS = 0
@@ -108,7 +112,7 @@ func shouldRoute(cfg pluginConfig, sourceFormat string, model string) bool {
 	if !cfg.Enabled || len(cfg.Models) == 0 {
 		return false
 	}
-	if len(cfg.SourceFormats) > 0 && !stringListContains(cfg.SourceFormats, normalizeKey(sourceFormat)) {
+	if len(cfg.SourceFormats) > 0 && !stringListContains(cfg.SourceFormats, normalizeSourceFormat(sourceFormat)) {
 		return false
 	}
 	return stringListContains(cfg.Models, normalizeKey(model))
@@ -254,6 +258,33 @@ func normalizeStringList(values []string) []string {
 		out = append(out, key)
 	}
 	return out
+}
+
+func normalizeSourceFormatList(values []string) []string {
+	out := make([]string, 0, len(values))
+	seen := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		key := normalizeSourceFormat(value)
+		if key == "" {
+			continue
+		}
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, key)
+	}
+	return out
+}
+
+func normalizeSourceFormat(value string) string {
+	key := normalizeKey(value)
+	switch key {
+	case "response", "responses", "openai-responses":
+		return "openai-response"
+	default:
+		return key
+	}
 }
 
 func normalizeStatusCodes(values []int) []int {
