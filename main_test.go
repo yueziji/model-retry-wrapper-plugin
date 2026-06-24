@@ -2,6 +2,7 @@ package main
 
 import (
 	"net/http"
+	"reflect"
 	"testing"
 	"time"
 )
@@ -47,6 +48,31 @@ func TestRetryAttemptHonorsConfiguredStatusAndMaxAttempts(t *testing.T) {
 	}
 	if shouldRetryAttempt(cfg, 1, http.StatusBadRequest) {
 		t.Fatal("expected non-configured status to bypass retry")
+	}
+}
+
+func TestDecodeConfigAcceptsStringStatusCodes(t *testing.T) {
+	cfg, err := decodeConfig([]byte(`
+enabled: true
+initial_delay_ms: 500
+max_delay_ms: 4000
+max_attempts: 0
+models:
+  - gpt-5.5-any
+  - gpt-5.5-ly
+status_codes:
+  - "408"
+  - "429"
+  - "500"
+  - "502"
+  - "503"
+  - "504"
+`))
+	if err != nil {
+		t.Fatalf("decodeConfig() error = %v", err)
+	}
+	if want := []int{408, 429, 500, 502, 503, 504}; !reflect.DeepEqual([]int(cfg.StatusCodes), want) {
+		t.Fatalf("StatusCodes = %#v, want %#v", []int(cfg.StatusCodes), want)
 	}
 }
 

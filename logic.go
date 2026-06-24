@@ -21,14 +21,16 @@ type lifecycleRequest struct {
 }
 
 type pluginConfig struct {
-	Enabled        bool     `yaml:"enabled"`
-	Models         []string `yaml:"models"`
-	SourceFormats  []string `yaml:"source_formats"`
-	StatusCodes    []int    `yaml:"status_codes"`
-	MaxAttempts    int      `yaml:"max_attempts"`
-	InitialDelayMS int      `yaml:"initial_delay_ms"`
-	MaxDelayMS     int      `yaml:"max_delay_ms"`
+	Enabled        bool           `yaml:"enabled"`
+	Models         []string       `yaml:"models"`
+	SourceFormats  []string       `yaml:"source_formats"`
+	StatusCodes    statusCodeList `yaml:"status_codes"`
+	MaxAttempts    int            `yaml:"max_attempts"`
+	InitialDelayMS int            `yaml:"initial_delay_ms"`
+	MaxDelayMS     int            `yaml:"max_delay_ms"`
 }
+
+type statusCodeList []int
 
 type retryStatusError struct {
 	status int
@@ -268,6 +270,59 @@ func normalizeStatusCodes(values []int) []int {
 		out = append(out, code)
 	}
 	return out
+}
+
+func (codes *statusCodeList) UnmarshalYAML(value *yaml.Node) error {
+	if value == nil || value.Kind == 0 || value.Tag == "!!null" {
+		*codes = nil
+		return nil
+	}
+	switch value.Kind {
+	case yaml.SequenceNode:
+		out := make([]int, 0, len(value.Content))
+		for _, item := range value.Content {
+			code, ok, errParse := parseStatusCodeYAMLNode(item)
+			if errParse != nil {
+				return errParse
+			}
+			if ok {
+				out = append(out, code)
+			}
+		}
+		*codes = out
+		return nil
+	case yaml.ScalarNode:
+		code, ok, errParse := parseStatusCodeYAMLNode(value)
+		if errParse != nil {
+			return errParse
+		}
+		if !ok {
+			*codes = nil
+			return nil
+		}
+		*codes = []int{code}
+		return nil
+	default:
+		return fmt.Errorf("status_codes must be a status code or a list of status codes")
+	}
+}
+
+func parseStatusCodeYAMLNode(value *yaml.Node) (int, bool, error) {
+	if value == nil || value.Kind == 0 || value.Tag == "!!null" {
+		return 0, false, nil
+	}
+	if value.Kind != yaml.ScalarNode {
+		return 0, false, fmt.Errorf("status_codes entries must be scalar values")
+	}
+	text := strings.TrimSpace(value.Value)
+	if text == "" {
+		return 0, false, nil
+	}
+	code, errAtoi := strconv.Atoi(text)
+	if errAtoi != nil {
+		return 0, false, fmt.Errorf("status_codes contains non-numeric value %q", value.Value)
+	}
+	return code, true, nil
 }
 
 func normalizeKey(value string) string {
