@@ -67,6 +67,16 @@ func configure(raw []byte) error {
 		cfg = decoded
 	}
 	currentConfig.Store(cfg)
+	pluginLog("", "info", "model-retry-wrapper: configured", map[string]any{
+		"enabled":          cfg.Enabled,
+		"models":           cfg.Models,
+		"source_formats":   cfg.SourceFormats,
+		"status_codes":     []int(cfg.StatusCodes),
+		"max_attempts":     cfg.MaxAttempts,
+		"initial_delay_ms": cfg.InitialDelayMS,
+		"max_delay_ms":     cfg.MaxDelayMS,
+		"executor_formats": supportedExecutorFormats(),
+	})
 	return nil
 }
 
@@ -116,6 +126,21 @@ func shouldRoute(cfg pluginConfig, sourceFormat string, model string) bool {
 		return false
 	}
 	return stringListContains(cfg.Models, normalizeKey(model))
+}
+
+func routeSkipReason(cfg pluginConfig, sourceFormat string, model string) string {
+	switch {
+	case !cfg.Enabled:
+		return "disabled"
+	case len(cfg.Models) == 0:
+		return "no_models_configured"
+	case len(cfg.SourceFormats) > 0 && !stringListContains(cfg.SourceFormats, normalizeSourceFormat(sourceFormat)):
+		return "source_format_not_configured"
+	case !stringListContains(cfg.Models, normalizeKey(model)):
+		return "model_not_configured"
+	default:
+		return "not_handled"
+	}
 }
 
 func shouldRetryAttempt(cfg pluginConfig, attempt int, status int) bool {
@@ -171,6 +196,33 @@ func waitRetryDelay(ctx context.Context, delay time.Duration) error {
 	case <-timer.C:
 		return nil
 	}
+}
+
+func logFieldsWith(fields map[string]any, key string, value any) map[string]any {
+	next := make(map[string]any, len(fields)+1)
+	for k, v := range fields {
+		next[k] = v
+	}
+	next[key] = value
+	return next
+}
+
+func shortError(err error) string {
+	if err == nil {
+		return ""
+	}
+	text := strings.TrimSpace(err.Error())
+	if len(text) <= 240 {
+		return text
+	}
+	return text[:240] + "..."
+}
+
+func durationMillis(value time.Duration) int64 {
+	if value <= 0 {
+		return 0
+	}
+	return value.Milliseconds()
 }
 
 func statusFromError(err error) int {

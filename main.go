@@ -123,6 +123,13 @@ type rpcStreamCloseRequest struct {
 	Error    string `json:"error,omitempty"`
 }
 
+type rpcHostLogRequest struct {
+	HostCallbackID string         `json:"host_callback_id,omitempty"`
+	Level          string         `json:"level,omitempty"`
+	Message        string         `json:"message,omitempty"`
+	Fields         map[string]any `json:"fields,omitempty"`
+}
+
 func main() {}
 
 //export cliproxy_plugin_init
@@ -227,9 +234,20 @@ func routeModel(raw []byte) ([]byte, error) {
 		return nil, errUnmarshal
 	}
 	cfg := loadedConfig()
+	routeFields := map[string]any{
+		"requested_model":          req.RequestedModel,
+		"source_format":            req.SourceFormat,
+		"normalized_source_format": normalizeSourceFormat(req.SourceFormat),
+		"enabled":                  cfg.Enabled,
+		"models":                   cfg.Models,
+		"source_formats":           cfg.SourceFormats,
+	}
 	if !shouldRoute(cfg, req.SourceFormat, req.RequestedModel) {
+		routeFields["reason"] = routeSkipReason(cfg, req.SourceFormat, req.RequestedModel)
+		pluginLog(req.HostCallbackID, "debug", "model-retry-wrapper: route skipped", routeFields)
 		return okEnvelope(pluginapi.ModelRouteResponse{Handled: false, Reason: "model_not_configured"})
 	}
+	pluginLog(req.HostCallbackID, "info", "model-retry-wrapper: route matched", routeFields)
 	return okEnvelope(pluginapi.ModelRouteResponse{
 		Handled:    true,
 		TargetKind: pluginapi.ModelRouteTargetSelf,
@@ -242,10 +260,23 @@ func execute(raw []byte) ([]byte, error) {
 	if errUnmarshal := json.Unmarshal(raw, &req); errUnmarshal != nil {
 		return nil, errUnmarshal
 	}
+	pluginLog(req.HostCallbackID, "debug", "model-retry-wrapper: execute received", map[string]any{
+		"model":          req.Model,
+		"source_format":  req.SourceFormat,
+		"format":         req.Format,
+		"entry_protocol": entryProtocol(req.ExecutorRequest),
+		"exit_protocol":  exitProtocol(req.ExecutorRequest),
+		"stream":         false,
+	})
 	resp, errRun := runModelExecuteWithRetry(context.Background(), req)
 	if errRun != nil {
+		pluginLog(req.HostCallbackID, "warn", "model-retry-wrapper: execute failed", map[string]any{
+			"model": req.Model,
+			"error": shortError(errRun),
+		})
 		return nil, errRun
 	}
+	pluginLog(req.HostCallbackID, "debug", "model-retry-wrapper: execute completed", map[string]any{"model": req.Model})
 	return okEnvelope(pluginapi.ExecutorResponse{Payload: resp.Body, Headers: resp.Headers})
 }
 
@@ -257,12 +288,25 @@ func executeStream(raw []byte) ([]byte, error) {
 	if strings.TrimSpace(req.StreamID) == "" {
 		return errorEnvelope("executor_error", "stream_id is required for executor.execute_stream"), nil
 	}
+	pluginLog(req.HostCallbackID, "debug", "model-retry-wrapper: stream execute received", map[string]any{
+		"model":          req.Model,
+		"source_format":  req.SourceFormat,
+		"format":         req.Format,
+		"entry_protocol": entryProtocol(req.ExecutorRequest),
+		"exit_protocol":  exitProtocol(req.ExecutorRequest),
+		"stream":         true,
+	})
 	go func() {
 		errRun := runModelStreamWithRetry(context.Background(), req)
 		if errRun != nil {
+			pluginLog(req.HostCallbackID, "warn", "model-retry-wrapper: stream failed", map[string]any{
+				"model": req.Model,
+				"error": shortError(errRun),
+			})
 			closePluginStream(req.StreamID, errRun.Error())
 			return
 		}
+		pluginLog(req.HostCallbackID, "debug", "model-retry-wrapper: stream completed", map[string]any{"model": req.Model})
 		closePluginStream(req.StreamID, "")
 	}()
 	return okEnvelope(map[string]any{
@@ -270,12 +314,30 @@ func executeStream(raw []byte) ([]byte, error) {
 	})
 }
 
+func retryLogFields(req rpcExecutorRequest, cfg pluginConfig, attempt int, status int, stream bool) map[string]any {
+	return map[string]any{
+		"model":            req.Model,
+		"entry_protocol":   entryProtocol(req.ExecutorRequest),
+		"exit_protocol":    exitProtocol(req.ExecutorRequest),
+		"source_format":    req.SourceFormat,
+		"format":           req.Format,
+		"stream":           stream,
+		"attempt":          attempt,
+		"status":           status,
+		"retryable_status": shouldRetryStatus(cfg, status),
+		"max_attempts":     cfg.MaxAttempts,
+		"status_codes":     []int(cfg.StatusCodes),
+	}
+}
+
 func runModelExecuteWithRetry(ctx context.Context, req rpcExecutorRequest) (pluginapi.HostModelExecutionResponse, error) {
 	cfg := loadedConfig()
+	pluginLog(req.HostCallbackID, "info", "model-retry-wrapper: retry executor start", retryLogFields(req, cfg, 0, 0, false))
 	var lastErr error
 	for attempt := 1; ; attempt++ {
 		resp, status, errCall := callHostModelExecute(req)
 		if errCall == nil && !shouldRetryStatus(cfg, status) {
+			pluginLog(req.HostCallbackID, "debug", "model-retry-wrapper: attempt completed without retry", retryLogFields(req, cfg, attempt, status, false))
 			return resp, nil
 		}
 		if errCall != nil {
@@ -284,10 +346,19 @@ func runModelExecuteWithRetry(ctx context.Context, req rpcExecutorRequest) (plug
 		} else {
 			lastErr = retryStatusError{status: status}
 		}
+		fields := retryLogFields(req, cfg, attempt, status, false)
+		if errCall != nil {
+			fields["error"] = shortError(errCall)
+		}
 		if !shouldRetryAttempt(cfg, attempt, status) {
+			pluginLog(req.HostCallbackID, "warn", "model-retry-wrapper: retry stopped", fields)
 			return pluginapi.HostModelExecutionResponse{}, lastErr
 		}
-		if errWait := waitRetryDelay(ctx, retryDelay(cfg, attempt)); errWait != nil {
+		delay := retryDelay(cfg, attempt)
+		fields["delay_ms"] = durationMillis(delay)
+		pluginLog(req.HostCallbackID, "warn", "model-retry-wrapper: retrying request", fields)
+		if errWait := waitRetryDelay(ctx, delay); errWait != nil {
+			pluginLog(req.HostCallbackID, "warn", "model-retry-wrapper: retry wait canceled", logFieldsWith(fields, "error", shortError(errWait)))
 			return pluginapi.HostModelExecutionResponse{}, errWait
 		}
 	}
@@ -295,10 +366,14 @@ func runModelExecuteWithRetry(ctx context.Context, req rpcExecutorRequest) (plug
 
 func runModelStreamWithRetry(ctx context.Context, req rpcExecutorRequest) error {
 	cfg := loadedConfig()
+	pluginLog(req.HostCallbackID, "info", "model-retry-wrapper: stream retry executor start", retryLogFields(req, cfg, 0, 0, true))
 	var lastErr error
 	for attempt := 1; ; attempt++ {
 		status, firstPayload, streamID, errStart := startHostModelStream(req)
 		if errStart == nil && !shouldRetryStatus(cfg, status) {
+			fields := retryLogFields(req, cfg, attempt, status, true)
+			fields["first_payload"] = len(firstPayload) > 0
+			pluginLog(req.HostCallbackID, "debug", "model-retry-wrapper: stream startup completed without retry", fields)
 			return forwardHostStream(ctx, streamID, firstPayload, req.StreamID)
 		}
 		if streamID != "" {
@@ -310,10 +385,19 @@ func runModelStreamWithRetry(ctx context.Context, req rpcExecutorRequest) error 
 		} else {
 			lastErr = retryStatusError{status: status}
 		}
+		fields := retryLogFields(req, cfg, attempt, status, true)
+		if errStart != nil {
+			fields["error"] = shortError(errStart)
+		}
 		if !shouldRetryAttempt(cfg, attempt, status) {
+			pluginLog(req.HostCallbackID, "warn", "model-retry-wrapper: stream retry stopped", fields)
 			return lastErr
 		}
-		if errWait := waitRetryDelay(ctx, retryDelay(cfg, attempt)); errWait != nil {
+		delay := retryDelay(cfg, attempt)
+		fields["delay_ms"] = durationMillis(delay)
+		pluginLog(req.HostCallbackID, "warn", "model-retry-wrapper: retrying stream startup", fields)
+		if errWait := waitRetryDelay(ctx, delay); errWait != nil {
+			pluginLog(req.HostCallbackID, "warn", "model-retry-wrapper: stream retry wait canceled", logFieldsWith(fields, "error", shortError(errWait)))
 			return errWait
 		}
 	}
