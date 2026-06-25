@@ -61,6 +61,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"runtime/debug"
 	"strings"
 	"unsafe"
 
@@ -151,12 +152,28 @@ func cliproxy_plugin_init(host *C.cliproxy_host_api, plugin *C.cliproxy_plugin_a
 }
 
 //export cliproxyPluginCall
-func cliproxyPluginCall(method *C.char, request *C.uint8_t, requestLen C.size_t, response *C.cliproxy_buffer) C.int {
+func cliproxyPluginCall(method *C.char, request *C.uint8_t, requestLen C.size_t, response *C.cliproxy_buffer) (rc C.int) {
 	if response != nil {
 		response.ptr = nil
 		response.len = 0
 	}
-	if method == nil {
+	methodName := ""
+	if method != nil {
+		methodName = C.GoString(method)
+	}
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			message := fmt.Sprintf("panic handling %s: %v", methodName, recovered)
+			pluginLog("", "error", "model-retry-wrapper: plugin call panic", map[string]any{
+				"method": methodName,
+				"panic":  fmt.Sprint(recovered),
+				"stack":  string(debug.Stack()),
+			})
+			writeResponse(response, errorEnvelope("plugin_panic", message))
+			rc = 1
+		}
+	}()
+	if methodName == "" {
 		writeResponse(response, errorEnvelope("invalid_method", "method is required"))
 		return 1
 	}
@@ -164,7 +181,7 @@ func cliproxyPluginCall(method *C.char, request *C.uint8_t, requestLen C.size_t,
 	if request != nil && requestLen > 0 {
 		requestBytes = C.GoBytes(unsafe.Pointer(request), C.int(requestLen))
 	}
-	raw, errHandle := handleMethod(C.GoString(method), requestBytes)
+	raw, errHandle := handleMethod(methodName, requestBytes)
 	if errHandle != nil {
 		writeResponse(response, errorEnvelope("plugin_error", errHandle.Error()))
 		return 1
@@ -302,6 +319,17 @@ func executeStream(raw []byte) ([]byte, error) {
 		"stream":         true,
 	})
 	go func() {
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				message := fmt.Sprintf("plugin stream panic: %v", recovered)
+				pluginLog(req.HostCallbackID, "error", "model-retry-wrapper: stream panic", map[string]any{
+					"model": req.Model,
+					"panic": fmt.Sprint(recovered),
+					"stack": string(debug.Stack()),
+				})
+				closePluginStream(req.StreamID, message)
+			}
+		}()
 		errRun := runModelStreamWithRetry(context.Background(), req)
 		if errRun != nil {
 			if errors.Is(errRun, errPluginStreamClosed) {
@@ -394,7 +422,7 @@ func runModelStreamWithRetry(ctx context.Context, req rpcExecutorRequest) error 
 			fields := retryLogFields(req, cfg, attempt, status, true)
 			fields["first_payload"] = len(firstPayload) > 0
 			pluginLog(req.HostCallbackID, "debug", "model-retry-wrapper: stream startup completed without retry", fields)
-			return forwardHostStream(ctx, streamID, firstPayload, req.StreamID)
+			return forwardHostStream(ctx, streamID, firstPayload, req)
 		}
 		if streamID != "" {
 			_ = closeHostModelStream(streamID)
@@ -501,23 +529,28 @@ func startHostModelStream(req rpcExecutorRequest) (int, []byte, string, error) {
 	}
 }
 
-func forwardHostStream(ctx context.Context, hostStreamID string, firstPayload []byte, pluginStreamID string) error {
+func forwardHostStream(ctx context.Context, hostStreamID string, firstPayload []byte, req rpcExecutorRequest) error {
 	defer func() { _ = closeHostModelStream(hostStreamID) }()
 	if len(firstPayload) > 0 {
-		if errEmit := emitPluginStreamChunk(pluginStreamID, firstPayload); errEmit != nil {
+		if errEmit := emitPluginStreamChunk(req.StreamID, firstPayload); errEmit != nil {
+			logStreamForwardError(req, "model-retry-wrapper: plugin stream emit failed", "first_payload", hostStreamID, errEmit)
 			return errEmit
 		}
 	}
 	for {
 		chunk, errRead := readHostModelStream(hostStreamID)
 		if errRead != nil {
+			logStreamForwardError(req, "model-retry-wrapper: host stream read failed", "read", hostStreamID, errRead)
 			return errRead
 		}
 		if chunk.Error != "" {
-			return fmt.Errorf("%s", chunk.Error)
+			errChunk := fmt.Errorf("%s", chunk.Error)
+			logStreamForwardError(req, "model-retry-wrapper: host stream returned error", "error_chunk", hostStreamID, errChunk)
+			return errChunk
 		}
 		if len(chunk.Payload) > 0 {
-			if errEmit := emitPluginStreamChunk(pluginStreamID, chunk.Payload); errEmit != nil {
+			if errEmit := emitPluginStreamChunk(req.StreamID, chunk.Payload); errEmit != nil {
+				logStreamForwardError(req, "model-retry-wrapper: plugin stream emit failed", "payload", hostStreamID, errEmit)
 				return errEmit
 			}
 		}
@@ -530,6 +563,20 @@ func forwardHostStream(ctx context.Context, hostStreamID string, firstPayload []
 		default:
 		}
 	}
+}
+
+func logStreamForwardError(req rpcExecutorRequest, message string, source string, hostStreamID string, err error) {
+	level := "warn"
+	if errors.Is(err, errPluginStreamClosed) {
+		level = "debug"
+	}
+	pluginLog(req.HostCallbackID, level, message, map[string]any{
+		"model":            req.Model,
+		"source":           source,
+		"error":            shortError(err),
+		"host_stream_id":   hostStreamID,
+		"plugin_stream_id": req.StreamID,
+	})
 }
 
 func readHostModelStream(streamID string) (pluginapi.HostModelStreamReadResponse, error) {
