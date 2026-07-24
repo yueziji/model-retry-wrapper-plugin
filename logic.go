@@ -68,17 +68,6 @@ func configure(raw []byte) error {
 		cfg = decoded
 	}
 	currentConfig.Store(cfg)
-	pluginLog("", "info", "model-retry-wrapper: configured", map[string]any{
-		"enabled":          cfg.Enabled,
-		"models":           cfg.Models,
-		"source_formats":   cfg.SourceFormats,
-		"status_codes":     []int(cfg.StatusCodes),
-		"retry_keywords":   cfg.RetryKeywords,
-		"max_attempts":     cfg.MaxAttempts,
-		"initial_delay_ms": cfg.InitialDelayMS,
-		"max_delay_ms":     cfg.MaxDelayMS,
-		"executor_formats": supportedExecutorFormats(),
-	})
 	return nil
 }
 
