@@ -1,57 +1,7 @@
 package main
 
 /*
-#include <stdint.h>
-#include <stdlib.h>
-
-typedef struct {
-	void* ptr;
-	size_t len;
-} cliproxy_buffer;
-
-typedef int (*cliproxy_host_call_fn)(void*, const char*, const uint8_t*, size_t, cliproxy_buffer*);
-typedef void (*cliproxy_host_free_fn)(void*, size_t);
-
-typedef struct {
-	uint32_t abi_version;
-	void* host_ctx;
-	cliproxy_host_call_fn call;
-	cliproxy_host_free_fn free_buffer;
-} cliproxy_host_api;
-
-typedef int (*cliproxy_plugin_call_fn)(char*, uint8_t*, size_t, cliproxy_buffer*);
-typedef void (*cliproxy_plugin_free_fn)(void*, size_t);
-typedef void (*cliproxy_plugin_shutdown_fn)(void);
-
-typedef struct {
-	uint32_t abi_version;
-	cliproxy_plugin_call_fn call;
-	cliproxy_plugin_free_fn free_buffer;
-	cliproxy_plugin_shutdown_fn shutdown;
-} cliproxy_plugin_api;
-
-extern int cliproxyPluginCall(char*, uint8_t*, size_t, cliproxy_buffer*);
-extern void cliproxyPluginFree(void*, size_t);
-extern void cliproxyPluginShutdown(void);
-
-static const cliproxy_host_api* stored_host;
-
-static void store_host_api(const cliproxy_host_api* host) {
-	stored_host = host;
-}
-
-static int call_host_api(const char* method, const uint8_t* request, size_t request_len, cliproxy_buffer* response) {
-	if (stored_host == NULL || stored_host->call == NULL) {
-		return 1;
-	}
-	return stored_host->call(stored_host->host_ctx, method, request, request_len, response);
-}
-
-static void free_host_buffer(void* ptr, size_t len) {
-	if (stored_host != NULL && stored_host->free_buffer != NULL && ptr != NULL) {
-		stored_host->free_buffer(ptr, len);
-	}
-}
+#include "bridge.h"
 */
 import "C"
 
@@ -71,7 +21,7 @@ import (
 
 const pluginIdentifier = "model-retry-wrapper"
 
-var pluginVersion = "0.0.7-dev"
+var pluginVersion = "dev"
 
 var errPluginStreamClosed = errors.New("plugin stream closed")
 
@@ -84,7 +34,6 @@ type envelope struct {
 type envelopeError struct {
 	Code       string `json:"code"`
 	Message    string `json:"message"`
-	Retryable  bool   `json:"retryable,omitempty"`
 	HTTPStatus int    `json:"http_status,omitempty"`
 }
 
@@ -140,9 +89,13 @@ func main() {}
 
 //export cliproxy_plugin_init
 func cliproxy_plugin_init(host *C.cliproxy_host_api, plugin *C.cliproxy_plugin_api) C.int {
-	if plugin == nil {
+	if host == nil || plugin == nil {
 		return 1
 	}
+	if uint32(host.abi_version) != pluginabi.ABIVersion {
+		return 2
+	}
+	pluginLifecycle.reopen()
 	C.store_host_api(host)
 	plugin.abi_version = C.uint32_t(pluginabi.ABIVersion)
 	plugin.call = C.cliproxy_plugin_call_fn(C.cliproxyPluginCall)
@@ -183,7 +136,7 @@ func cliproxyPluginCall(method *C.char, request *C.uint8_t, requestLen C.size_t,
 	}
 	raw, errHandle := handleMethod(methodName, requestBytes)
 	if errHandle != nil {
-		writeResponse(response, errorEnvelope("plugin_error", errHandle.Error()))
+		writeResponse(response, errorEnvelopeForError("plugin_error", errHandle))
 		return 1
 	}
 	writeResponse(response, raw)
@@ -198,7 +151,10 @@ func cliproxyPluginFree(ptr unsafe.Pointer, _ C.size_t) {
 }
 
 //export cliproxyPluginShutdown
-func cliproxyPluginShutdown() {}
+func cliproxyPluginShutdown() {
+	pluginLifecycle.shutdown(closeHostModelStream)
+	C.store_host_api(nil)
+}
 
 func handleMethod(method string, request []byte) ([]byte, error) {
 	switch method {
@@ -217,6 +173,8 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 		return executeStream(request)
 	case pluginabi.MethodExecutorCountTokens:
 		return okEnvelope(pluginapi.ExecutorResponse{Payload: []byte(`{"input_tokens":0}`)})
+	case pluginabi.MethodExecutorHTTPRequest:
+		return errorEnvelopeWithStatus("not_supported", "executor.http_request is not supported by this retry wrapper", http.StatusNotImplemented), nil
 	default:
 		return errorEnvelope("unknown_method", "unknown method: "+method), nil
 	}
@@ -234,10 +192,11 @@ func pluginRegistration() registration {
 				{Name: "models", Type: pluginapi.ConfigFieldTypeArray, Description: "Client-requested model names or aliases wrapped by this retry executor."},
 				{Name: "source_formats", Type: pluginapi.ConfigFieldTypeArray, Description: "Optional inbound protocol filter such as openai, openai-response, claude, or gemini."},
 				{Name: "status_codes", Type: pluginapi.ConfigFieldTypeArray, Description: "HTTP status codes retried inside the plugin before downstream delivery."},
-				{Name: "retry_keywords", Type: pluginapi.ConfigFieldTypeArray, Description: "Fallback error substrings retried when the host callback does not include an HTTP status code."},
-				{Name: "max_attempts", Type: pluginapi.ConfigFieldTypeInteger, Description: "Maximum attempts, including the first try. 0 means no attempt cap."},
-				{Name: "initial_delay_ms", Type: pluginapi.ConfigFieldTypeInteger, Description: "Initial delay before a retry."},
-				{Name: "max_delay_ms", Type: pluginapi.ConfigFieldTypeInteger, Description: "Maximum exponential backoff delay."},
+				{Name: "retry_keywords", Type: pluginapi.ConfigFieldTypeArray, Description: "Fallback error substrings; an explicit empty list disables keyword retries."},
+				{Name: "max_attempts", Type: pluginapi.ConfigFieldTypeInteger, Description: "Maximum attempts, including the first try. 0 removes only the attempt-count cap."},
+				{Name: "initial_delay_ms", Type: pluginapi.ConfigFieldTypeInteger, Description: "Positive initial delay before a retry."},
+				{Name: "max_delay_ms", Type: pluginapi.ConfigFieldTypeInteger, Description: "Positive maximum exponential backoff delay."},
+				{Name: "max_elapsed_time_ms", Type: pluginapi.ConfigFieldTypeInteger, Description: "Wall-clock limit for one retry sequence. 0 removes the time limit."},
 			},
 		},
 		Capabilities: registrationCapability{
@@ -290,7 +249,11 @@ func execute(raw []byte) ([]byte, error) {
 		"exit_protocol":  exitProtocol(req.ExecutorRequest),
 		"stream":         false,
 	})
-	resp, errRun := runModelExecuteWithRetry(context.Background(), req)
+	ctx, errContext := pluginLifecycle.context()
+	if errContext != nil {
+		return nil, retryStatusError{status: http.StatusServiceUnavailable, err: errContext}
+	}
+	resp, errRun := runModelExecuteWithRetry(ctx, req)
 	if errRun != nil {
 		pluginLog(req.HostCallbackID, "warn", "model-retry-wrapper: execute failed", map[string]any{
 			"model": req.Model,
@@ -318,7 +281,12 @@ func executeStream(raw []byte) ([]byte, error) {
 		"exit_protocol":  exitProtocol(req.ExecutorRequest),
 		"stream":         true,
 	})
+	ctx, errContext := pluginLifecycle.beginStreamTask()
+	if errContext != nil {
+		return errorEnvelopeForError("plugin_shutting_down", retryStatusError{status: http.StatusServiceUnavailable, err: errContext}), nil
+	}
 	go func() {
+		defer pluginLifecycle.endStreamTask()
 		defer func() {
 			if recovered := recover(); recovered != nil {
 				message := fmt.Sprintf("plugin stream panic: %v", recovered)
@@ -330,7 +298,7 @@ func executeStream(raw []byte) ([]byte, error) {
 				closePluginStream(req.StreamID, message)
 			}
 		}()
-		errRun := runModelStreamWithRetry(context.Background(), req)
+		errRun := runModelStreamWithRetry(ctx, req)
 		if errRun != nil {
 			if errors.Is(errRun, errPluginStreamClosed) {
 				pluginLog(req.HostCallbackID, "debug", "model-retry-wrapper: stream canceled", map[string]any{
@@ -356,26 +324,32 @@ func executeStream(raw []byte) ([]byte, error) {
 
 func retryLogFields(req rpcExecutorRequest, cfg pluginConfig, attempt int, status int, stream bool) map[string]any {
 	return map[string]any{
-		"model":            req.Model,
-		"entry_protocol":   entryProtocol(req.ExecutorRequest),
-		"exit_protocol":    exitProtocol(req.ExecutorRequest),
-		"source_format":    req.SourceFormat,
-		"format":           req.Format,
-		"stream":           stream,
-		"attempt":          attempt,
-		"status":           status,
-		"retryable_status": shouldRetryStatus(cfg, status),
-		"max_attempts":     cfg.MaxAttempts,
-		"status_codes":     []int(cfg.StatusCodes),
-		"retry_keywords":   cfg.RetryKeywords,
+		"model":               req.Model,
+		"entry_protocol":      entryProtocol(req.ExecutorRequest),
+		"exit_protocol":       exitProtocol(req.ExecutorRequest),
+		"source_format":       req.SourceFormat,
+		"format":              req.Format,
+		"stream":              stream,
+		"attempt":             attempt,
+		"status":              status,
+		"retryable_status":    shouldRetryStatus(cfg, status),
+		"max_attempts":        cfg.MaxAttempts,
+		"max_elapsed_time_ms": cfg.MaxElapsedMS,
+		"status_codes":        []int(cfg.StatusCodes),
+		"retry_keywords":      cfg.RetryKeywords,
 	}
 }
 
 func runModelExecuteWithRetry(ctx context.Context, req rpcExecutorRequest) (pluginapi.HostModelExecutionResponse, error) {
 	cfg := loadedConfig()
+	ctx, cancel := retryContext(ctx, cfg)
+	defer cancel()
 	pluginLog(req.HostCallbackID, "info", "model-retry-wrapper: retry executor start", retryLogFields(req, cfg, 0, 0, false))
 	var lastErr error
 	for attempt := 1; ; attempt++ {
+		if errContext := ctx.Err(); errContext != nil {
+			return pluginapi.HostModelExecutionResponse{}, retryTerminationError(lastErr, errContext)
+		}
 		resp, status, errCall := callHostModelExecute(req)
 		if errCall == nil && !shouldRetryStatus(cfg, status) {
 			pluginLog(req.HostCallbackID, "debug", "model-retry-wrapper: attempt completed without retry", retryLogFields(req, cfg, attempt, status, false))
@@ -383,7 +357,7 @@ func runModelExecuteWithRetry(ctx context.Context, req rpcExecutorRequest) (plug
 		}
 		if errCall != nil {
 			status = statusFromError(errCall)
-			lastErr = errCall
+			lastErr = errorWithStatus(errCall, status)
 		} else {
 			lastErr = retryStatusError{status: status}
 		}
@@ -404,16 +378,21 @@ func runModelExecuteWithRetry(ctx context.Context, req rpcExecutorRequest) (plug
 		pluginLog(req.HostCallbackID, "warn", "model-retry-wrapper: retrying request", fields)
 		if errWait := waitRetryDelay(ctx, delay); errWait != nil {
 			pluginLog(req.HostCallbackID, "warn", "model-retry-wrapper: retry wait canceled", logFieldsWith(fields, "error", shortError(errWait)))
-			return pluginapi.HostModelExecutionResponse{}, errWait
+			return pluginapi.HostModelExecutionResponse{}, retryTerminationError(lastErr, errWait)
 		}
 	}
 }
 
 func runModelStreamWithRetry(ctx context.Context, req rpcExecutorRequest) error {
 	cfg := loadedConfig()
+	ctx, cancel := retryContext(ctx, cfg)
+	defer cancel()
 	pluginLog(req.HostCallbackID, "info", "model-retry-wrapper: stream retry executor start", retryLogFields(req, cfg, 0, 0, true))
 	var lastErr error
 	for attempt := 1; ; attempt++ {
+		if errContext := ctx.Err(); errContext != nil {
+			return retryTerminationError(lastErr, errContext)
+		}
 		if errProbe := probePluginStreamOpen(req.StreamID); errProbe != nil {
 			return errProbe
 		}
@@ -425,11 +404,11 @@ func runModelStreamWithRetry(ctx context.Context, req rpcExecutorRequest) error 
 			return forwardHostStream(ctx, streamID, firstPayload, req)
 		}
 		if streamID != "" {
-			_ = closeHostModelStream(streamID)
+			_ = closeTrackedHostModelStream(streamID)
 		}
 		if errStart != nil {
 			status = statusFromError(errStart)
-			lastErr = errStart
+			lastErr = errorWithStatus(errStart, status)
 		} else {
 			lastErr = retryStatusError{status: status}
 		}
@@ -452,7 +431,7 @@ func runModelStreamWithRetry(ctx context.Context, req rpcExecutorRequest) error 
 			return probePluginStreamOpen(req.StreamID)
 		}); errWait != nil {
 			pluginLog(req.HostCallbackID, "warn", "model-retry-wrapper: stream retry wait canceled", logFieldsWith(fields, "error", shortError(errWait)))
-			return errWait
+			return retryTerminationError(lastErr, errWait)
 		}
 	}
 }
@@ -511,6 +490,10 @@ func startHostModelStream(req rpcExecutorRequest) (int, []byte, string, error) {
 	if strings.TrimSpace(resp.StreamID) == "" {
 		return 0, nil, "", fmt.Errorf("host model stream returned empty stream_id")
 	}
+	if errTrack := pluginLifecycle.trackHostStream(resp.StreamID); errTrack != nil {
+		_ = closeHostModelStream(resp.StreamID)
+		return 0, nil, "", errTrack
+	}
 	for {
 		chunk, errRead := readHostModelStream(resp.StreamID)
 		if errRead != nil {
@@ -530,7 +513,7 @@ func startHostModelStream(req rpcExecutorRequest) (int, []byte, string, error) {
 }
 
 func forwardHostStream(ctx context.Context, hostStreamID string, firstPayload []byte, req rpcExecutorRequest) error {
-	defer func() { _ = closeHostModelStream(hostStreamID) }()
+	defer func() { _ = closeTrackedHostModelStream(hostStreamID) }()
 	if len(firstPayload) > 0 {
 		if errEmit := emitPluginStreamChunk(req.StreamID, firstPayload); errEmit != nil {
 			logStreamForwardError(req, "model-retry-wrapper: plugin stream emit failed", "first_payload", hostStreamID, errEmit)
@@ -596,6 +579,12 @@ func closeHostModelStream(streamID string) error {
 	return errCall
 }
 
+func closeTrackedHostModelStream(streamID string) error {
+	errClose := closeHostModelStream(streamID)
+	pluginLifecycle.untrackHostStream(streamID)
+	return errClose
+}
+
 func emitPluginStreamChunk(streamID string, payload []byte) error {
 	if strings.TrimSpace(streamID) == "" {
 		return fmt.Errorf("plugin stream id is required")
@@ -615,7 +604,7 @@ func probePluginStreamOpen(streamID string) error {
 	if errCall != nil {
 		return fmt.Errorf("%w: %v", errPluginStreamClosed, errCall)
 	}
-	return errCall
+	return nil
 }
 
 func closePluginStream(streamID, errMsg string) {
@@ -683,13 +672,33 @@ func okEnvelope(v any) ([]byte, error) {
 }
 
 func errorEnvelope(code, message string) []byte {
-	raw, _ := json.Marshal(envelope{OK: false, Error: &envelopeError{Code: code, Message: message}})
+	return errorEnvelopeWithStatus(code, message, 0)
+}
+
+func errorEnvelopeForError(code string, err error) []byte {
+	if err == nil {
+		return errorEnvelope(code, "plugin call failed")
+	}
+	return errorEnvelopeWithStatus(code, err.Error(), structuredStatusFromError(err))
+}
+
+func errorEnvelopeWithStatus(code, message string, status int) []byte {
+	raw, _ := json.Marshal(envelope{OK: false, Error: &envelopeError{
+		Code:       code,
+		Message:    message,
+		HTTPStatus: status,
+	}})
 	return raw
 }
 
 func writeResponse(response *C.cliproxy_buffer, raw []byte) {
 	if response == nil || len(raw) == 0 {
 		return
+	}
+	if response.ptr != nil {
+		C.free(response.ptr)
+		response.ptr = nil
+		response.len = 0
 	}
 	ptr := C.CBytes(raw)
 	if ptr == nil {

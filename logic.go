@@ -3,8 +3,11 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"math"
 	"net/http"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -29,6 +32,7 @@ type pluginConfig struct {
 	MaxAttempts    int            `yaml:"max_attempts"`
 	InitialDelayMS int            `yaml:"initial_delay_ms"`
 	MaxDelayMS     int            `yaml:"max_delay_ms"`
+	MaxElapsedMS   int            `yaml:"max_elapsed_time_ms"`
 }
 
 type statusCodeList []int
@@ -42,6 +46,10 @@ type retryStatusError struct {
 	err    error
 }
 
+const maxDurationMillis = int64(math.MaxInt64) / int64(time.Millisecond)
+
+var explicitHTTPStatusPattern = regexp.MustCompile(`(?i)\b(?:http(?:\s+(?:response\s+)?status(?:\s+code)?)?|status(?:\s+code)?)\s*[:=]?\s*([45][0-9]{2})\b`)
+
 func (e retryStatusError) Error() string {
 	if e.err != nil {
 		return e.err.Error()
@@ -50,6 +58,14 @@ func (e retryStatusError) Error() string {
 		return fmt.Sprintf("host model status %d", e.status)
 	}
 	return "host model execution failed"
+}
+
+func (e retryStatusError) StatusCode() int {
+	return e.status
+}
+
+func (e retryStatusError) Unwrap() error {
+	return e.err
 }
 
 func configure(raw []byte) error {
@@ -79,6 +95,7 @@ func defaultPluginConfig() pluginConfig {
 		MaxAttempts:    0,
 		InitialDelayMS: 500,
 		MaxDelayMS:     10000,
+		MaxElapsedMS:   0,
 	}
 }
 
@@ -91,19 +108,42 @@ func decodeConfig(raw []byte) (pluginConfig, error) {
 	cfg.SourceFormats = normalizeSourceFormatList(cfg.SourceFormats)
 	cfg.StatusCodes = normalizeStatusCodes(cfg.StatusCodes)
 	cfg.RetryKeywords = normalizeStringList(cfg.RetryKeywords)
-	if len(cfg.RetryKeywords) == 0 {
-		cfg.RetryKeywords = defaultPluginConfig().RetryKeywords
+	if cfg.MaxAttempts < 0 {
+		return pluginConfig{}, fmt.Errorf("max_attempts must be 0 or greater")
 	}
-	if cfg.InitialDelayMS < 0 {
-		cfg.InitialDelayMS = 0
+	if errValidate := validatePositiveDurationMillis("initial_delay_ms", cfg.InitialDelayMS); errValidate != nil {
+		return pluginConfig{}, errValidate
 	}
-	if cfg.MaxDelayMS < 0 {
-		cfg.MaxDelayMS = 0
+	if errValidate := validatePositiveDurationMillis("max_delay_ms", cfg.MaxDelayMS); errValidate != nil {
+		return pluginConfig{}, errValidate
 	}
-	if cfg.MaxDelayMS > 0 && cfg.InitialDelayMS > cfg.MaxDelayMS {
-		cfg.InitialDelayMS = cfg.MaxDelayMS
+	if errValidate := validateOptionalDurationMillis("max_elapsed_time_ms", cfg.MaxElapsedMS); errValidate != nil {
+		return pluginConfig{}, errValidate
+	}
+	if cfg.InitialDelayMS > cfg.MaxDelayMS {
+		return pluginConfig{}, fmt.Errorf("initial_delay_ms must not exceed max_delay_ms")
 	}
 	return cfg, nil
+}
+
+func validatePositiveDurationMillis(name string, value int) error {
+	if value <= 0 {
+		return fmt.Errorf("%s must be greater than 0", name)
+	}
+	if int64(value) > maxDurationMillis {
+		return fmt.Errorf("%s exceeds the maximum supported duration", name)
+	}
+	return nil
+}
+
+func validateOptionalDurationMillis(name string, value int) error {
+	if value < 0 {
+		return fmt.Errorf("%s must be 0 or greater", name)
+	}
+	if int64(value) > maxDurationMillis {
+		return fmt.Errorf("%s exceeds the maximum supported duration", name)
+	}
+	return nil
 }
 
 func loadedConfig() pluginConfig {
@@ -196,22 +236,38 @@ func retryKeywordFromError(cfg pluginConfig, err error) string {
 }
 
 func retryDelay(cfg pluginConfig, attempt int) time.Duration {
-	base := time.Duration(cfg.InitialDelayMS) * time.Millisecond
-	if base < 0 {
-		base = 0
-	}
+	base := durationFromMillis(cfg.InitialDelayMS)
 	if attempt <= 1 || base == 0 {
 		return base
 	}
+	maxDelay := durationFromMillis(cfg.MaxDelayMS)
 	delay := base
 	for i := 1; i < attempt; i++ {
+		if maxDelay > 0 && delay >= maxDelay {
+			return maxDelay
+		}
+		if delay > time.Duration(math.MaxInt64)/2 {
+			if maxDelay > 0 {
+				return maxDelay
+			}
+			return time.Duration(math.MaxInt64)
+		}
 		delay *= 2
-		maxDelay := time.Duration(cfg.MaxDelayMS) * time.Millisecond
 		if maxDelay > 0 && delay > maxDelay {
 			return maxDelay
 		}
 	}
 	return delay
+}
+
+func durationFromMillis(value int) time.Duration {
+	if value <= 0 {
+		return 0
+	}
+	if int64(value) > maxDurationMillis {
+		return time.Duration(math.MaxInt64)
+	}
+	return time.Duration(value) * time.Millisecond
 }
 
 func waitRetryDelay(ctx context.Context, delay time.Duration) error {
@@ -287,35 +343,49 @@ func statusFromError(err error) int {
 	if err == nil {
 		return 0
 	}
-	var retryErr retryStatusError
-	if asRetryStatusError(err, &retryErr) && retryErr.status > 0 {
-		return retryErr.status
+	if status := structuredStatusFromError(err); status > 0 {
+		return status
 	}
-	text := err.Error()
-	fields := strings.FieldsFunc(text, func(r rune) bool {
-		return r < '0' || r > '9'
-	})
-	for _, field := range fields {
-		if len(field) != 3 {
-			continue
-		}
-		code, errAtoi := strconv.Atoi(field)
-		if errAtoi == nil && code >= 100 && code <= 599 {
-			return code
+	match := explicitHTTPStatusPattern.FindStringSubmatch(err.Error())
+	if len(match) != 2 {
+		return 0
+	}
+	code, errAtoi := strconv.Atoi(match[1])
+	if errAtoi != nil || code < 400 || code > 599 {
+		return 0
+	}
+	return code
+}
+
+func structuredStatusFromError(err error) int {
+	if err == nil {
+		return 0
+	}
+	var statusErr interface{ StatusCode() int }
+	if errors.As(err, &statusErr) && statusErr != nil {
+		if status := statusErr.StatusCode(); status >= 100 && status <= 599 {
+			return status
 		}
 	}
 	return 0
 }
 
-func asRetryStatusError(err error, target *retryStatusError) bool {
-	if err == nil || target == nil {
-		return false
+func errorWithStatus(err error, status int) error {
+	if err == nil || status < 100 || status > 599 {
+		return err
 	}
-	if value, ok := err.(retryStatusError); ok {
-		*target = value
-		return true
+	if structuredStatusFromError(err) == status {
+		return err
 	}
-	return false
+	return retryStatusError{status: status, err: err}
+}
+
+func retryTerminationError(lastErr error, terminationErr error) error {
+	if lastErr == nil {
+		return terminationErr
+	}
+	wrapped := fmt.Errorf("retry stopped: %w; last error: %w", terminationErr, lastErr)
+	return errorWithStatus(wrapped, statusFromError(lastErr))
 }
 
 func requestBody(req pluginapi.ExecutorRequest) []byte {

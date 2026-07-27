@@ -2,5 +2,7 @@
 *.dylib
 *.so
 *.h
+!bridge.h
 bin/
 dist/
+.tmp/

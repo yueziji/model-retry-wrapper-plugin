@@ -16,7 +16,7 @@ The plugin is intended for explicit retry aliases such as `retry-codex-gpt-5.5` 
 
 ## Configuration
 
-Download a `v0.0.7` or newer release asset for your platform, extract the dynamic library, and place it under CPA's plugin directory. The library basename must be `model-retry-wrapper` so CPA maps it to `plugins.configs.model-retry-wrapper`.
+Download a `v0.0.10` or newer release asset for your platform, extract the dynamic library, and place it under CPA's plugin directory. The library basename must be `model-retry-wrapper` so CPA maps it to `plugins.configs.model-retry-wrapper`.
 
 Release archives contain the expected platform filename:
 
@@ -46,11 +46,14 @@ plugins:
       max_attempts: 0
       initial_delay_ms: 500
       max_delay_ms: 10000
+      max_elapsed_time_ms: 0
 ```
 
-`max_attempts` includes the first upstream attempt. `0` means no attempt cap. Downstream cancellation stops requests through CPA host callbacks; streaming startup retries also probe the downstream plugin stream during backoff so canceled streams stop instead of continuing the retry loop.
+`max_attempts` includes the first upstream attempt; `0` removes the attempt-count cap. `max_elapsed_time_ms` limits the wall-clock duration of each complete retry sequence; `0` (the default) removes that limit. Setting both fields to `0` retries until success or external cancellation. A positive elapsed-time limit stops backoff or prevents the next attempt, but it cannot preempt a host callback that is already running. `initial_delay_ms` and `max_delay_ms` must be greater than `0`, `max_elapsed_time_ms` must be `0` or greater, and the initial delay must not exceed the maximum delay. In particular, `max_delay_ms: 0` does not mean unlimited.
 
-`status_codes` is the primary retry rule. `retry_keywords` is only a fallback for host callback errors that do not expose a numeric HTTP status, such as `rate_limited`; if omitted or saved as an empty list, the default fallback is `rate_limited`.
+Downstream cancellation stops requests through CPA host callbacks; streaming startup retries also probe the downstream plugin stream during backoff so canceled streams stop instead of continuing the retry loop. Plugin shutdown cancels its background streams and waits for them to stop calling the host. An unbounded synchronous retry can delay hot unload while its call remains active, so cancel active requests or restart CPA when replacing the plugin. Go also does not guarantee that a `c-shared` library can be safely hot-unloaded in every process.
+
+`status_codes` is the primary retry rule. `retry_keywords` is only a fallback for host callback errors that do not expose an explicit HTTP status, such as `rate_limited`. Omit `retry_keywords` to use the default `rate_limited` fallback; set `retry_keywords: []` to disable keyword retries and use status codes only.
 
 ## Alias Pattern
 
@@ -89,7 +92,7 @@ From this repository root:
 
 ```bash
 go test .
-go build -buildmode=c-shared -ldflags "-X main.pluginVersion=0.0.7" -o model-retry-wrapper.dll .
+go build -buildmode=c-shared -o model-retry-wrapper.dll .
 ```
 
 Use the platform extension expected by your target system:
@@ -103,8 +106,8 @@ Use the platform extension expected by your target system:
 This repository includes a GitHub Actions release workflow. Run `Release` manually with the next semver tag, or push a tag such as:
 
 ```bash
-git tag v0.0.7
-git push origin v0.0.7
+git tag v0.0.10
+git push origin v0.0.10
 ```
 
 The workflow runs tests, builds Windows/Linux/macOS dynamic libraries, injects the tag version into plugin metadata, and publishes zip archives as GitHub Release assets.
