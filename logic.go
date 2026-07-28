@@ -13,14 +13,21 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 	"gopkg.in/yaml.v3"
 )
 
 var currentConfig atomic.Value
 
+// lifecycleSchemaVersion is the minimum negotiated schema that delivers request.complete events.
+const lifecycleSchemaVersion = 2
+
+var hostSchemaVersion atomic.Uint32
+
 type lifecycleRequest struct {
-	ConfigYAML []byte `json:"config_yaml"`
+	ConfigYAML    []byte `json:"config_yaml"`
+	SchemaVersion uint32 `json:"schema_version"`
 }
 
 type pluginConfig struct {
@@ -83,8 +90,25 @@ func configure(raw []byte) error {
 		}
 		cfg = decoded
 	}
+	hostSchemaVersion.Store(negotiatedSchemaVersion(req.SchemaVersion))
 	currentConfig.Store(cfg)
 	return nil
+}
+
+// negotiatedSchemaVersion caps the advertised schema at what both sides support.
+// Hosts predating schema negotiation omit schema_version and are treated as schema 1.
+func negotiatedSchemaVersion(hostVersion uint32) uint32 {
+	if hostVersion == 0 {
+		return 1
+	}
+	if hostVersion > pluginabi.SchemaVersion {
+		return pluginabi.SchemaVersion
+	}
+	return hostVersion
+}
+
+func lifecycleEventsSupported(schemaVersion uint32) bool {
+	return schemaVersion >= lifecycleSchemaVersion
 }
 
 func defaultPluginConfig() pluginConfig {
@@ -284,7 +308,7 @@ func waitRetryDelay(ctx context.Context, delay time.Duration) error {
 	}
 }
 
-func waitRetryDelayWithProbe(ctx context.Context, delay time.Duration, probe func() error) error {
+func waitRetryDelayWithProbe(ctx context.Context, delay time.Duration, wake <-chan struct{}, probe func() error) error {
 	if probe != nil {
 		if err := probe(); err != nil {
 			return err
@@ -293,23 +317,33 @@ func waitRetryDelayWithProbe(ctx context.Context, delay time.Duration, probe fun
 	if delay <= 0 {
 		return nil
 	}
-	remaining := delay
-	for remaining > 0 {
+	deadline := time.Now().Add(delay)
+	for {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return nil
+		}
 		step := remaining
 		if step > time.Second {
 			step = time.Second
 		}
-		if err := waitRetryDelay(ctx, step); err != nil {
-			return err
+		timer := time.NewTimer(step)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-wake:
+			// Terminal lifecycle event: probe now. A clean probe means the event
+			// belonged to another request; keep waiting out the original backoff.
+			timer.Stop()
+		case <-timer.C:
 		}
-		remaining -= step
 		if probe != nil {
 			if err := probe(); err != nil {
 				return err
 			}
 		}
 	}
-	return nil
 }
 
 func logFieldsWith(fields map[string]any, key string, value any) map[string]any {

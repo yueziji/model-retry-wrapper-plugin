@@ -264,7 +264,7 @@ func TestRetryContextAllowsUnboundedElapsedTime(t *testing.T) {
 func TestWaitRetryDelayWithProbeStopsOnProbeError(t *testing.T) {
 	want := errors.New("stream closed")
 	calls := 0
-	err := waitRetryDelayWithProbe(context.Background(), time.Millisecond, func() error {
+	err := waitRetryDelayWithProbe(context.Background(), time.Millisecond, nil, func() error {
 		calls++
 		if calls > 1 {
 			return want
@@ -276,6 +276,45 @@ func TestWaitRetryDelayWithProbeStopsOnProbeError(t *testing.T) {
 	}
 	if calls != 2 {
 		t.Fatalf("probe calls = %d, want 2", calls)
+	}
+}
+
+func TestWaitRetryDelayWithProbeWakesEarlyOnLifecycleEvent(t *testing.T) {
+	closed := errors.New("stream closed")
+	wake := make(chan struct{}, 1)
+	calls := 0
+	start := time.Now()
+	go func() {
+		time.Sleep(10 * time.Millisecond)
+		wake <- struct{}{}
+	}()
+	err := waitRetryDelayWithProbe(context.Background(), time.Minute, wake, func() error {
+		calls++
+		if calls > 1 {
+			return closed
+		}
+		return nil
+	})
+	if !errors.Is(err, closed) {
+		t.Fatalf("waitRetryDelayWithProbe() error = %v, want %v", err, closed)
+	}
+	if elapsed := time.Since(start); elapsed >= 900*time.Millisecond {
+		t.Fatalf("wake took %v, expected early wake before the 1s periodic probe", elapsed)
+	}
+}
+
+func TestWaitRetryDelayWithProbeKeepsWaitingWhenWakeProbesClean(t *testing.T) {
+	wake := make(chan struct{}, 1)
+	wake <- struct{}{}
+	start := time.Now()
+	err := waitRetryDelayWithProbe(context.Background(), 30*time.Millisecond, wake, func() error {
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("waitRetryDelayWithProbe() error = %v, want nil", err)
+	}
+	if elapsed := time.Since(start); elapsed < 30*time.Millisecond {
+		t.Fatalf("returned after %v, want the full 30ms backoff despite a clean wake", elapsed)
 	}
 }
 
@@ -406,5 +445,118 @@ func TestPluginLifecycleShutdownCancelsAndWaitsForStreamTask(t *testing.T) {
 	}
 	if _, errBegin := state.beginStreamTask(); errBegin == nil {
 		t.Fatal("beginStreamTask() succeeded after shutdown")
+	}
+}
+
+func TestNegotiatedSchemaVersionCapsAtPluginSupport(t *testing.T) {
+	tests := []struct {
+		host uint32
+		want uint32
+	}{
+		{host: 0, want: 1},
+		{host: 1, want: 1},
+		{host: 2, want: 2},
+		{host: 99, want: pluginabi.SchemaVersion},
+	}
+	for _, tt := range tests {
+		if got := negotiatedSchemaVersion(tt.host); got != tt.want {
+			t.Fatalf("negotiatedSchemaVersion(%d) = %d, want %d", tt.host, got, tt.want)
+		}
+	}
+}
+
+func TestRegistrationGatesLifecycleCapabilityOnSchemaVersion(t *testing.T) {
+	prev := hostSchemaVersion.Load()
+	defer hostSchemaVersion.Store(prev)
+
+	hostSchemaVersion.Store(1)
+	reg := pluginRegistration()
+	if reg.SchemaVersion != 1 {
+		t.Fatalf("SchemaVersion = %d, want 1 against a schema-1 host", reg.SchemaVersion)
+	}
+	if reg.Capabilities.RequestLifecyclePlugin {
+		t.Fatal("request_lifecycle_plugin advertised to a schema-1 host")
+	}
+
+	hostSchemaVersion.Store(2)
+	reg = pluginRegistration()
+	if reg.SchemaVersion != 2 {
+		t.Fatalf("SchemaVersion = %d, want 2 against a schema-2 host", reg.SchemaVersion)
+	}
+	if !reg.Capabilities.RequestLifecyclePlugin {
+		t.Fatal("request_lifecycle_plugin not advertised to a schema-2 host")
+	}
+}
+
+func TestConfigureStoresNegotiatedSchemaVersion(t *testing.T) {
+	prev := hostSchemaVersion.Load()
+	defer hostSchemaVersion.Store(prev)
+
+	if err := configure([]byte(`{"schema_version":2}`)); err != nil {
+		t.Fatalf("configure() error = %v", err)
+	}
+	if got := hostSchemaVersion.Load(); got != 2 {
+		t.Fatalf("hostSchemaVersion = %d, want 2", got)
+	}
+
+	if err := configure([]byte(`{}`)); err != nil {
+		t.Fatalf("configure() error = %v", err)
+	}
+	if got := hostSchemaVersion.Load(); got != 1 {
+		t.Fatalf("hostSchemaVersion = %d, want 1 for hosts omitting schema_version", got)
+	}
+}
+
+func TestWakeStreamRetryWaitersPulsesEveryRegisteredWaker(t *testing.T) {
+	state := newPluginLifecycleState()
+	wakeA, cleanupA := state.registerStreamRetryWaker("stream-a")
+	defer cleanupA()
+	wakeB, cleanupB := state.registerStreamRetryWaker("stream-b")
+
+	state.wakeStreamRetryWaiters()
+	select {
+	case <-wakeA:
+	default:
+		t.Fatal("waker A was not pulsed")
+	}
+	select {
+	case <-wakeB:
+	default:
+		t.Fatal("waker B was not pulsed")
+	}
+
+	// Repeated wakes must not block even when nobody drains the channel.
+	state.wakeStreamRetryWaiters()
+	state.wakeStreamRetryWaiters()
+
+	cleanupB()
+	state.wakeStreamRetryWaiters()
+	select {
+	case <-wakeA:
+	default:
+		t.Fatal("waker A was not pulsed after B unregistered")
+	}
+}
+
+func TestHandleRequestCompleteWakesWaitersOnTerminalOutcomes(t *testing.T) {
+	wake, cleanup := pluginLifecycle.registerStreamRetryWaker("stream-complete-test")
+	defer cleanup()
+
+	if _, err := handleRequestComplete([]byte(`{"Outcome":"canceled","RequestID":"req-1"}`)); err != nil {
+		t.Fatalf("handleRequestComplete() error = %v", err)
+	}
+	select {
+	case <-wake:
+	default:
+		t.Fatal("canceled completion did not wake stream retry waiters")
+	}
+
+	if _, err := handleRequestComplete([]byte(`{"Outcome":"succeeded"}`)); err != nil {
+		t.Fatalf("handleRequestComplete() error = %v", err)
+	}
+	select {
+	case <-wake:
+		t.Fatal("succeeded completion should not wake stream retry waiters")
+	default:
 	}
 }

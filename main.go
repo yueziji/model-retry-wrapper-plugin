@@ -44,11 +44,12 @@ type registration struct {
 }
 
 type registrationCapability struct {
-	ModelRouter           bool     `json:"model_router"`
-	Executor              bool     `json:"executor"`
-	ExecutorModelScope    string   `json:"executor_model_scope"`
-	ExecutorInputFormats  []string `json:"executor_input_formats"`
-	ExecutorOutputFormats []string `json:"executor_output_formats"`
+	ModelRouter            bool     `json:"model_router"`
+	Executor               bool     `json:"executor"`
+	RequestLifecyclePlugin bool     `json:"request_lifecycle_plugin"`
+	ExecutorModelScope     string   `json:"executor_model_scope"`
+	ExecutorInputFormats   []string `json:"executor_input_formats"`
+	ExecutorOutputFormats  []string `json:"executor_output_formats"`
 }
 
 type rpcExecutorRequest struct {
@@ -64,6 +65,11 @@ type rpcModelRouteRequest struct {
 
 type hostModelExecutionRequest struct {
 	pluginapi.HostModelExecutionRequest
+	HostCallbackID string `json:"host_callback_id,omitempty"`
+}
+
+type rpcRequestCompletion struct {
+	pluginapi.RequestCompletion
 	HostCallbackID string `json:"host_callback_id,omitempty"`
 }
 
@@ -171,6 +177,8 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 		return execute(request)
 	case pluginabi.MethodExecutorExecuteStream:
 		return executeStream(request)
+	case pluginabi.MethodRequestComplete:
+		return handleRequestComplete(request)
 	case pluginabi.MethodExecutorCountTokens:
 		return okEnvelope(pluginapi.ExecutorResponse{Payload: []byte(`{"input_tokens":0}`)})
 	case pluginabi.MethodExecutorHTTPRequest:
@@ -181,8 +189,9 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 }
 
 func pluginRegistration() registration {
+	schemaVersion := negotiatedSchemaVersion(hostSchemaVersion.Load())
 	return registration{
-		SchemaVersion: pluginabi.SchemaVersion,
+		SchemaVersion: schemaVersion,
 		Metadata: pluginapi.Metadata{
 			Name:             pluginIdentifier,
 			Version:          pluginVersion,
@@ -200,13 +209,40 @@ func pluginRegistration() registration {
 			},
 		},
 		Capabilities: registrationCapability{
-			ModelRouter:           true,
-			Executor:              true,
-			ExecutorModelScope:    string(pluginapi.ExecutorModelScopeStatic),
-			ExecutorInputFormats:  supportedExecutorFormats(),
-			ExecutorOutputFormats: supportedExecutorFormats(),
+			ModelRouter:            true,
+			Executor:               true,
+			RequestLifecyclePlugin: lifecycleEventsSupported(schemaVersion),
+			ExecutorModelScope:     string(pluginapi.ExecutorModelScopeStatic),
+			ExecutorInputFormats:   supportedExecutorFormats(),
+			ExecutorOutputFormats:  supportedExecutorFormats(),
 		},
 	}
+}
+
+// handleRequestComplete receives asynchronous terminal request events from the host.
+// Executor requests carry no request id, so events cannot be matched to a specific
+// in-flight retry; instead terminal failures wake every waiting stream retry loop,
+// and each loop probes its own plugin stream to decide whether to stop.
+func handleRequestComplete(raw []byte) ([]byte, error) {
+	var req rpcRequestCompletion
+	if len(raw) > 0 {
+		if errUnmarshal := json.Unmarshal(raw, &req); errUnmarshal != nil {
+			return nil, errUnmarshal
+		}
+	}
+	switch req.Outcome {
+	case pluginapi.RequestCompletionCanceled, pluginapi.RequestCompletionFailed, pluginapi.RequestCompletionRejected:
+		pluginLifecycle.wakeStreamRetryWaiters()
+		pluginLog(req.HostCallbackID, "debug", "model-retry-wrapper: terminal request event", map[string]any{
+			"request_id": req.RequestID,
+			"trace_id":   req.TraceID,
+			"model":      req.Model,
+			"stream":     req.Stream,
+			"outcome":    string(req.Outcome),
+			"status":     req.StatusCode,
+		})
+	}
+	return okEnvelope(map[string]any{})
 }
 
 func routeModel(raw []byte) ([]byte, error) {
@@ -387,6 +423,8 @@ func runModelStreamWithRetry(ctx context.Context, req rpcExecutorRequest) error 
 	cfg := loadedConfig()
 	ctx, cancel := retryContext(ctx, cfg)
 	defer cancel()
+	wake, unregisterWaker := pluginLifecycle.registerStreamRetryWaker(req.StreamID)
+	defer unregisterWaker()
 	pluginLog(req.HostCallbackID, "info", "model-retry-wrapper: stream retry executor start", retryLogFields(req, cfg, 0, 0, true))
 	var lastErr error
 	for attempt := 1; ; attempt++ {
@@ -427,7 +465,7 @@ func runModelStreamWithRetry(ctx context.Context, req rpcExecutorRequest) error 
 		delay := retryDelay(cfg, attempt)
 		fields["delay_ms"] = durationMillis(delay)
 		pluginLog(req.HostCallbackID, "warn", "model-retry-wrapper: retrying stream startup", fields)
-		if errWait := waitRetryDelayWithProbe(ctx, delay, func() error {
+		if errWait := waitRetryDelayWithProbe(ctx, delay, wake, func() error {
 			return probePluginStreamOpen(req.StreamID)
 		}); errWait != nil {
 			pluginLog(req.HostCallbackID, "warn", "model-retry-wrapper: stream retry wait canceled", logFieldsWith(fields, "error", shortError(errWait)))
