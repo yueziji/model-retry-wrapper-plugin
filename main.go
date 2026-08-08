@@ -46,6 +46,7 @@ type registration struct {
 type registrationCapability struct {
 	ModelRouter            bool     `json:"model_router"`
 	Executor               bool     `json:"executor"`
+	RequestInterceptor     bool     `json:"request_interceptor"`
 	RequestLifecyclePlugin bool     `json:"request_lifecycle_plugin"`
 	ExecutorModelScope     string   `json:"executor_model_scope"`
 	ExecutorInputFormats   []string `json:"executor_input_formats"`
@@ -60,6 +61,11 @@ type rpcExecutorRequest struct {
 
 type rpcModelRouteRequest struct {
 	pluginapi.ModelRouteRequest
+	HostCallbackID string `json:"host_callback_id,omitempty"`
+}
+
+type rpcRequestInterceptRequest struct {
+	pluginapi.RequestInterceptRequest
 	HostCallbackID string `json:"host_callback_id,omitempty"`
 }
 
@@ -171,6 +177,8 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 		return okEnvelope(pluginRegistration())
 	case pluginabi.MethodModelRoute:
 		return routeModel(request)
+	case pluginabi.MethodRequestInterceptBefore, pluginabi.MethodRequestInterceptAfter:
+		return interceptRequest(request)
 	case pluginabi.MethodExecutorIdentifier:
 		return okEnvelope(map[string]string{"identifier": pluginIdentifier})
 	case pluginabi.MethodExecutorExecute:
@@ -211,6 +219,7 @@ func pluginRegistration() registration {
 		Capabilities: registrationCapability{
 			ModelRouter:            true,
 			Executor:               true,
+			RequestInterceptor:     lifecycleEventsSupported(schemaVersion),
 			RequestLifecyclePlugin: lifecycleEventsSupported(schemaVersion),
 			ExecutorModelScope:     string(pluginapi.ExecutorModelScopeStatic),
 			ExecutorInputFormats:   supportedExecutorFormats(),
@@ -219,10 +228,39 @@ func pluginRegistration() registration {
 	}
 }
 
+// interceptRequest carries the host-generated lifecycle RequestID through the
+// request headers into this plugin's executor. The executor strips the header
+// before forwarding the nested request upstream.
+func interceptRequest(raw []byte) ([]byte, error) {
+	var req rpcRequestInterceptRequest
+	if len(raw) > 0 {
+		if errUnmarshal := json.Unmarshal(raw, &req); errUnmarshal != nil {
+			return nil, errUnmarshal
+		}
+	}
+	cfg := loadedConfig()
+	requestID := normalizeRequestID(req.RequestID)
+	requestedModel := req.RequestedModel
+	if strings.TrimSpace(requestedModel) == "" {
+		requestedModel = req.Model
+	}
+	if !lifecycleEventsSupported(hostSchemaVersion.Load()) || requestID == "" || !shouldRoute(cfg, req.SourceFormat, requestedModel) {
+		return okEnvelope(pluginapi.RequestInterceptResponse{})
+	}
+	headers := cloneHeader(req.Headers)
+	if headers == nil {
+		headers = make(http.Header)
+	}
+	headers.Set(retryRequestIDHeader, requestID)
+	return okEnvelope(pluginapi.RequestInterceptResponse{
+		Headers: headers,
+	})
+}
+
 // handleRequestComplete receives asynchronous terminal request events from the host.
-// Executor requests carry no request id, so events cannot be matched to a specific
-// in-flight retry; instead terminal failures wake every waiting stream retry loop,
-// and each loop probes its own plugin stream to decide whether to stop.
+// The request interceptor carries RequestID into the executor request so a
+// completion event can cancel exactly one in-flight retry. Stream waiters are
+// still woken as a fallback for hosts/requests that have no correlation header.
 func handleRequestComplete(raw []byte) ([]byte, error) {
 	var req rpcRequestCompletion
 	if len(raw) > 0 {
@@ -232,6 +270,12 @@ func handleRequestComplete(raw []byte) ([]byte, error) {
 	}
 	switch req.Outcome {
 	case pluginapi.RequestCompletionCanceled, pluginapi.RequestCompletionFailed, pluginapi.RequestCompletionRejected:
+		requestedModel := req.RequestedModel
+		if strings.TrimSpace(requestedModel) == "" {
+			requestedModel = req.Model
+		}
+		remember := req.Outcome == pluginapi.RequestCompletionCanceled && shouldRoute(loadedConfig(), req.SourceFormat, requestedModel)
+		canceled := pluginLifecycle.cancelRequest(req.RequestID, remember)
 		pluginLifecycle.wakeStreamRetryWaiters()
 		pluginLog(req.HostCallbackID, "debug", "model-retry-wrapper: terminal request event", map[string]any{
 			"request_id": req.RequestID,
@@ -240,6 +284,7 @@ func handleRequestComplete(raw []byte) ([]byte, error) {
 			"stream":     req.Stream,
 			"outcome":    string(req.Outcome),
 			"status":     req.StatusCode,
+			"matched":    canceled,
 		})
 	}
 	return okEnvelope(map[string]any{})
@@ -277,6 +322,8 @@ func execute(raw []byte) ([]byte, error) {
 	if errUnmarshal := json.Unmarshal(raw, &req); errUnmarshal != nil {
 		return nil, errUnmarshal
 	}
+	requestID := requestIDFromHeaders(req.Headers)
+	req.Headers = stripRequestIDHeader(req.Headers)
 	pluginLog(req.HostCallbackID, "debug", "model-retry-wrapper: execute received", map[string]any{
 		"model":          req.Model,
 		"source_format":  req.SourceFormat,
@@ -285,10 +332,11 @@ func execute(raw []byte) ([]byte, error) {
 		"exit_protocol":  exitProtocol(req.ExecutorRequest),
 		"stream":         false,
 	})
-	ctx, errContext := pluginLifecycle.context()
+	ctx, releaseRequest, errContext := pluginLifecycle.registerRequest(nil, requestID)
 	if errContext != nil {
 		return nil, retryStatusError{status: http.StatusServiceUnavailable, err: errContext}
 	}
+	defer releaseRequest()
 	resp, errRun := runModelExecuteWithRetry(ctx, req)
 	if errRun != nil {
 		pluginLog(req.HostCallbackID, "warn", "model-retry-wrapper: execute failed", map[string]any{
@@ -306,6 +354,8 @@ func executeStream(raw []byte) ([]byte, error) {
 	if errUnmarshal := json.Unmarshal(raw, &req); errUnmarshal != nil {
 		return nil, errUnmarshal
 	}
+	requestID := requestIDFromHeaders(req.Headers)
+	req.Headers = stripRequestIDHeader(req.Headers)
 	if strings.TrimSpace(req.StreamID) == "" {
 		return errorEnvelope("executor_error", "stream_id is required for executor.execute_stream"), nil
 	}
@@ -317,11 +367,17 @@ func executeStream(raw []byte) ([]byte, error) {
 		"exit_protocol":  exitProtocol(req.ExecutorRequest),
 		"stream":         true,
 	})
-	ctx, errContext := pluginLifecycle.beginStreamTask()
+	baseCtx, errContext := pluginLifecycle.beginStreamTask()
 	if errContext != nil {
 		return errorEnvelopeForError("plugin_shutting_down", retryStatusError{status: http.StatusServiceUnavailable, err: errContext}), nil
 	}
+	ctx, releaseRequest, errRegister := pluginLifecycle.registerRequest(baseCtx, requestID)
+	if errRegister != nil {
+		pluginLifecycle.endStreamTask()
+		return errorEnvelopeForError("plugin_shutting_down", retryStatusError{status: http.StatusServiceUnavailable, err: errRegister}), nil
+	}
 	go func() {
+		defer releaseRequest()
 		defer pluginLifecycle.endStreamTask()
 		defer func() {
 			if recovered := recover(); recovered != nil {

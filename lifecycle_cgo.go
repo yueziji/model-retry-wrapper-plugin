@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"time"
 )
 
 type pluginLifecycleState struct {
@@ -16,7 +17,18 @@ type pluginLifecycleState struct {
 	streamTasks       sync.WaitGroup
 	activeHostStreams map[string]struct{}
 	streamRetryWakers map[string]chan struct{}
+	activeRequests    map[string]*requestCancellation
+	pendingCancels    map[string]time.Time
 }
+
+type requestCancellation struct {
+	cancel context.CancelFunc
+}
+
+const (
+	pendingCancelTTL  = 30 * time.Second
+	maxPendingCancels = 1024
+)
 
 var pluginLifecycle = newPluginLifecycleState()
 
@@ -27,6 +39,8 @@ func newPluginLifecycleState() *pluginLifecycleState {
 		cancel:            cancel,
 		activeHostStreams: make(map[string]struct{}),
 		streamRetryWakers: make(map[string]chan struct{}),
+		activeRequests:    make(map[string]*requestCancellation),
+		pendingCancels:    make(map[string]time.Time),
 	}
 }
 
@@ -44,18 +58,115 @@ func (s *pluginLifecycleState) reopen() {
 	s.streamTasks = sync.WaitGroup{}
 	s.activeHostStreams = make(map[string]struct{})
 	s.streamRetryWakers = make(map[string]chan struct{})
+	s.activeRequests = make(map[string]*requestCancellation)
+	s.pendingCancels = make(map[string]time.Time)
 }
 
-func (s *pluginLifecycleState) context() (context.Context, error) {
+// registerRequest creates a per-executor context and, when a RequestID is
+// available, makes it cancellable by a matching request.complete event.
+// The returned cleanup is safe to call more than once.
+func (s *pluginLifecycleState) registerRequest(parent context.Context, requestID string) (context.Context, func(), error) {
 	if s == nil {
-		return nil, fmt.Errorf("plugin lifecycle is unavailable")
+		return nil, func() {}, fmt.Errorf("plugin lifecycle is unavailable")
+	}
+	requestID = normalizeRequestID(requestID)
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return nil, func() {}, fmt.Errorf("plugin is shutting down")
+	}
+	if parent == nil {
+		parent = s.ctx
+	}
+	if parent == nil {
+		parent = context.Background()
+	}
+	ctx, cancel := context.WithCancel(parent)
+	entry := &requestCancellation{cancel: cancel}
+	var previous *requestCancellation
+	pendingCancel := false
+	if requestID != "" {
+		if s.activeRequests == nil {
+			s.activeRequests = make(map[string]*requestCancellation)
+		}
+		if s.pendingCancels == nil {
+			s.pendingCancels = make(map[string]time.Time)
+		}
+		now := time.Now()
+		s.prunePendingCancelsLocked(now)
+		if expiresAt, ok := s.pendingCancels[requestID]; ok {
+			pendingCancel = now.Before(expiresAt)
+			delete(s.pendingCancels, requestID)
+		}
+		previous = s.activeRequests[requestID]
+		s.activeRequests[requestID] = entry
+	}
+	s.mu.Unlock()
+
+	// Request IDs should be unique. If a malformed host reuses one, stop the
+	// older operation rather than allowing two retries to share one key.
+	if previous != nil {
+		previous.cancel()
+	}
+	if pendingCancel {
+		cancel()
+	}
+
+	var once sync.Once
+	cleanup := func() {
+		once.Do(func() {
+			s.mu.Lock()
+			if requestID != "" && s.activeRequests[requestID] == entry {
+				delete(s.activeRequests, requestID)
+			}
+			s.mu.Unlock()
+			cancel()
+		})
+	}
+	return ctx, cleanup, nil
+}
+
+// cancelRequest cancels only the executor associated with requestID. When
+// remember is true and registration has not happened yet, a short-lived
+// tombstone closes the cancellation-before-registration race.
+func (s *pluginLifecycleState) cancelRequest(requestID string, remember bool) bool {
+	if s == nil {
+		return false
+	}
+	requestID = normalizeRequestID(requestID)
+	if requestID == "" {
+		return false
 	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.closed {
-		return nil, fmt.Errorf("plugin is shutting down")
+	entry := s.activeRequests[requestID]
+	if entry == nil && remember {
+		if s.pendingCancels == nil {
+			s.pendingCancels = make(map[string]time.Time)
+		}
+		now := time.Now()
+		s.prunePendingCancelsLocked(now)
+		if len(s.pendingCancels) >= maxPendingCancels {
+			for pendingID := range s.pendingCancels {
+				delete(s.pendingCancels, pendingID)
+				break
+			}
+		}
+		s.pendingCancels[requestID] = now.Add(pendingCancelTTL)
 	}
-	return s.ctx, nil
+	s.mu.Unlock()
+	if entry == nil || entry.cancel == nil {
+		return remember
+	}
+	entry.cancel()
+	return true
+}
+
+func (s *pluginLifecycleState) prunePendingCancelsLocked(now time.Time) {
+	for requestID, expiresAt := range s.pendingCancels {
+		if !now.Before(expiresAt) {
+			delete(s.pendingCancels, requestID)
+		}
+	}
 }
 
 func (s *pluginLifecycleState) beginStreamTask() (context.Context, error) {
@@ -122,9 +233,8 @@ func (s *pluginLifecycleState) registerStreamRetryWaker(pluginStreamID string) (
 	}
 }
 
-// wakeStreamRetryWaiters pulses every registered waker. Completion events carry no
-// executor-visible request id, so the wake is a broadcast; each woken loop re-probes
-// its own plugin stream and only exits if that stream is really gone.
+// wakeStreamRetryWaiters is a fallback broadcast. Each woken loop re-probes its
+// own plugin stream and only exits if that stream is really gone.
 func (s *pluginLifecycleState) wakeStreamRetryWaiters() {
 	if s == nil {
 		return
@@ -161,8 +271,19 @@ func (s *pluginLifecycleState) shutdown(closeHostStream func(string) error) {
 	for streamID := range s.activeHostStreams {
 		streamIDs = append(streamIDs, streamID)
 	}
+	requestCancels := make([]context.CancelFunc, 0, len(s.activeRequests))
+	for _, entry := range s.activeRequests {
+		if entry != nil && entry.cancel != nil {
+			requestCancels = append(requestCancels, entry.cancel)
+		}
+	}
+	s.activeRequests = make(map[string]*requestCancellation)
+	s.pendingCancels = make(map[string]time.Time)
 	s.mu.Unlock()
 
+	for _, cancel := range requestCancels {
+		cancel()
+	}
 	for _, streamID := range streamIDs {
 		if closeHostStream != nil {
 			_ = closeHostStream(streamID)

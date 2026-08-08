@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 )
 
 func TestShouldRouteMatchesConfiguredModelAlias(t *testing.T) {
@@ -477,6 +478,9 @@ func TestRegistrationGatesLifecycleCapabilityOnSchemaVersion(t *testing.T) {
 	if reg.Capabilities.RequestLifecyclePlugin {
 		t.Fatal("request_lifecycle_plugin advertised to a schema-1 host")
 	}
+	if reg.Capabilities.RequestInterceptor {
+		t.Fatal("request_interceptor advertised to a schema-1 host")
+	}
 
 	hostSchemaVersion.Store(2)
 	reg = pluginRegistration()
@@ -485,6 +489,9 @@ func TestRegistrationGatesLifecycleCapabilityOnSchemaVersion(t *testing.T) {
 	}
 	if !reg.Capabilities.RequestLifecyclePlugin {
 		t.Fatal("request_lifecycle_plugin not advertised to a schema-2 host")
+	}
+	if !reg.Capabilities.RequestInterceptor {
+		t.Fatal("request_interceptor not advertised to a schema-2 host")
 	}
 }
 
@@ -557,6 +564,183 @@ func TestHandleRequestCompleteWakesWaitersOnTerminalOutcomes(t *testing.T) {
 	select {
 	case <-wake:
 		t.Fatal("succeeded completion should not wake stream retry waiters")
+	default:
+	}
+}
+
+func TestRequestInterceptorCarriesRequestIDForRoutedRequest(t *testing.T) {
+	previousSchema := hostSchemaVersion.Load()
+	previousConfig := loadedConfig()
+	defer func() {
+		hostSchemaVersion.Store(previousSchema)
+		currentConfig.Store(previousConfig)
+	}()
+
+	cfg := defaultPluginConfig()
+	cfg.Models = []string{"retry-test-model"}
+	currentConfig.Store(cfg)
+	hostSchemaVersion.Store(lifecycleSchemaVersion)
+
+	rawRequest, errMarshal := json.Marshal(rpcRequestInterceptRequest{
+		RequestInterceptRequest: pluginapi.RequestInterceptRequest{
+			RequestID:      "request-123",
+			SourceFormat:   "openai",
+			RequestedModel: "retry-test-model",
+			Headers:        http.Header{"X-Test": []string{"preserve"}},
+		},
+	})
+	if errMarshal != nil {
+		t.Fatalf("json.Marshal() error = %v", errMarshal)
+	}
+	rawResponse, errIntercept := interceptRequest(rawRequest)
+	if errIntercept != nil {
+		t.Fatalf("interceptRequest() error = %v", errIntercept)
+	}
+	var env envelope
+	if errUnmarshal := json.Unmarshal(rawResponse, &env); errUnmarshal != nil {
+		t.Fatalf("decode envelope error = %v", errUnmarshal)
+	}
+	var response pluginapi.RequestInterceptResponse
+	if errUnmarshal := json.Unmarshal(env.Result, &response); errUnmarshal != nil {
+		t.Fatalf("decode interceptor response error = %v", errUnmarshal)
+	}
+	if got := response.Headers.Get(retryRequestIDHeader); got != "request-123" {
+		t.Fatalf("request id header = %q, want request-123", got)
+	}
+	if got := response.Headers.Get("X-Test"); got != "preserve" {
+		t.Fatalf("preserved header = %q, want preserve", got)
+	}
+
+	rawRequest, errMarshal = json.Marshal(rpcRequestInterceptRequest{
+		RequestInterceptRequest: pluginapi.RequestInterceptRequest{
+			RequestID:      "request-456",
+			SourceFormat:   "openai",
+			RequestedModel: "unconfigured-model",
+		},
+	})
+	if errMarshal != nil {
+		t.Fatalf("json.Marshal(nonmatching) error = %v", errMarshal)
+	}
+	rawResponse, errIntercept = interceptRequest(rawRequest)
+	if errIntercept != nil {
+		t.Fatalf("interceptRequest(nonmatching) error = %v", errIntercept)
+	}
+	if errUnmarshal := json.Unmarshal(rawResponse, &env); errUnmarshal != nil {
+		t.Fatalf("decode nonmatching envelope error = %v", errUnmarshal)
+	}
+	if errUnmarshal := json.Unmarshal(env.Result, &response); errUnmarshal != nil {
+		t.Fatalf("decode nonmatching response error = %v", errUnmarshal)
+	}
+	if got := response.Headers.Get(retryRequestIDHeader); got != "" {
+		t.Fatalf("nonmatching request id header = %q, want empty", got)
+	}
+}
+
+func TestRequestIDHeaderIsStrippedBeforeNestedExecution(t *testing.T) {
+	headers := http.Header{
+		strings.ToLower(retryRequestIDHeader): []string{"request-789"},
+		"X-Test":                              []string{"preserve"},
+	}
+	if got := requestIDFromHeaders(headers); got != "request-789" {
+		t.Fatalf("requestIDFromHeaders() = %q, want request-789", got)
+	}
+	stripped := stripRequestIDHeader(headers)
+	if got := requestIDFromHeaders(stripped); got != "" {
+		t.Fatalf("requestIDFromHeaders(stripped) = %q, want empty", got)
+	}
+	if got := stripped.Get("X-Test"); got != "preserve" {
+		t.Fatalf("preserved header = %q, want preserve", got)
+	}
+	if got := requestIDFromHeaders(headers); got != "request-789" {
+		t.Fatalf("original headers were modified; request id = %q", got)
+	}
+}
+
+func TestRequestCancellationIsScopedByRequestID(t *testing.T) {
+	state := newPluginLifecycleState()
+	ctxA, cleanupA, errA := state.registerRequest(nil, "request-a")
+	if errA != nil {
+		t.Fatalf("registerRequest(A) error = %v", errA)
+	}
+	defer cleanupA()
+	ctxB, cleanupB, errB := state.registerRequest(nil, "request-b")
+	if errB != nil {
+		t.Fatalf("registerRequest(B) error = %v", errB)
+	}
+	defer cleanupB()
+
+	if !state.cancelRequest("request-a", false) {
+		t.Fatal("cancelRequest(A) returned false")
+	}
+	select {
+	case <-ctxA.Done():
+	case <-time.After(time.Second):
+		t.Fatal("request A context was not canceled")
+	}
+	select {
+	case <-ctxB.Done():
+		t.Fatal("canceling request A canceled request B")
+	default:
+	}
+}
+
+func TestRequestCancellationBeforeRegistrationIsRemembered(t *testing.T) {
+	state := newPluginLifecycleState()
+	if !state.cancelRequest("request-before-register", true) {
+		t.Fatal("cancelRequest() did not remember pending cancellation")
+	}
+	ctx, cleanup, errRegister := state.registerRequest(nil, "request-before-register")
+	if errRegister != nil {
+		t.Fatalf("registerRequest() error = %v", errRegister)
+	}
+	defer cleanup()
+	select {
+	case <-ctx.Done():
+		if !errors.Is(ctx.Err(), context.Canceled) {
+			t.Fatalf("context error = %v, want canceled", ctx.Err())
+		}
+	case <-time.After(time.Second):
+		t.Fatal("pending cancellation did not cancel late registration")
+	}
+}
+
+func TestHandleRequestCompleteCancelsOnlyMatchingRequest(t *testing.T) {
+	previousLifecycle := pluginLifecycle
+	pluginLifecycle = newPluginLifecycleState()
+	defer func() {
+		pluginLifecycle.shutdown(nil)
+		pluginLifecycle = previousLifecycle
+	}()
+
+	ctxA, cleanupA, errA := pluginLifecycle.registerRequest(nil, "request-complete-a")
+	if errA != nil {
+		t.Fatalf("registerRequest(A) error = %v", errA)
+	}
+	defer cleanupA()
+	ctxB, cleanupB, errB := pluginLifecycle.registerRequest(nil, "request-complete-b")
+	if errB != nil {
+		t.Fatalf("registerRequest(B) error = %v", errB)
+	}
+	defer cleanupB()
+
+	raw, errMarshal := json.Marshal(pluginapi.RequestCompletion{
+		RequestID: "request-complete-a",
+		Outcome:   pluginapi.RequestCompletionCanceled,
+	})
+	if errMarshal != nil {
+		t.Fatalf("json.Marshal(completion) error = %v", errMarshal)
+	}
+	if _, errComplete := handleRequestComplete(raw); errComplete != nil {
+		t.Fatalf("handleRequestComplete() error = %v", errComplete)
+	}
+	select {
+	case <-ctxA.Done():
+	case <-time.After(time.Second):
+		t.Fatal("matching request was not canceled")
+	}
+	select {
+	case <-ctxB.Done():
+		t.Fatal("nonmatching request was canceled")
 	default:
 	}
 }

@@ -25,6 +25,12 @@ const lifecycleSchemaVersion = 2
 
 var hostSchemaVersion atomic.Uint32
 
+// retryRequestIDHeader is an internal correlation header added by the request
+// interceptor and removed before the nested host model call reaches upstream.
+const retryRequestIDHeader = "X-Model-Retry-Wrapper-Request-Id"
+
+const maxRequestIDLength = 128
+
 type lifecycleRequest struct {
 	ConfigYAML    []byte `json:"config_yaml"`
 	SchemaVersion uint32 `json:"schema_version"`
@@ -572,6 +578,38 @@ func parseStatusCodeYAMLNode(value *yaml.Node) (int, bool, error) {
 
 func normalizeKey(value string) string {
 	return strings.ToLower(strings.TrimSpace(value))
+}
+
+func normalizeRequestID(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" || len(value) > maxRequestIDLength {
+		return ""
+	}
+	return value
+}
+
+func requestIDFromHeaders(headers http.Header) string {
+	for key, values := range headers {
+		if !strings.EqualFold(key, retryRequestIDHeader) {
+			continue
+		}
+		for _, value := range values {
+			if requestID := normalizeRequestID(value); requestID != "" {
+				return requestID
+			}
+		}
+	}
+	return ""
+}
+
+func stripRequestIDHeader(headers http.Header) http.Header {
+	cloned := cloneHeader(headers)
+	for key := range cloned {
+		if strings.EqualFold(key, retryRequestIDHeader) {
+			delete(cloned, key)
+		}
+	}
+	return cloned
 }
 
 func stringListContains(values []string, needle string) bool {
