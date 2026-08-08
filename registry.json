@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "plugins": [
+    {
+      "id": "model-retry-wrapper",
+      "name": "Model Retry Wrapper",
+      "description": "Retries selected model aliases inside CLIProxyAPI before errors reach downstream clients, with request-scoped cancellation.",
+      "author": "yueziji",
+      "repository": "https://github.com/yueziji/model-retry-wrapper-plugin",
+      "homepage": "https://github.com/yueziji/model-retry-wrapper-plugin",
+      "license": "MIT",
+      "tags": [
+        "Executor",
+        "Router",
+        "Retry",
+        "Claude",
+        "Codex",
+        "OpenAI"
+      ]
+    }
+  ]
+}

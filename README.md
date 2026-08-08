@@ -16,6 +16,23 @@ The plugin is intended for explicit retry aliases such as `retry-codex-gpt-5.5` 
 
 ## Configuration
 
+### Install from a custom CPA plugin source
+
+CPA versions that support `plugins.store-sources` can discover this plugin, check its latest GitHub release, and install or update it from the Management Center. Add this repository's registry URL to CPA:
+
+```yaml
+plugins:
+  enabled: true
+  store-sources:
+    - "https://raw.githubusercontent.com/yueziji/model-retry-wrapper-plugin/master/registry.json"
+```
+
+Open the CPA plugin store, select **Model Retry Wrapper**, and install or update it. Releases `v0.0.13` and newer publish the CPA-standard platform archives and `checksums.txt` required for verified installation. CPA reports when a newer release is available; applying the update remains an explicit Management Center action rather than an unattended background replacement.
+
+After installation, configure at least one model under `plugins.configs.model-retry-wrapper.models` as shown below. Without a configured model, the plugin intentionally routes no requests.
+
+### Manual installation
+
 Download a `v0.0.11` or newer release asset for your platform, extract the dynamic library, and place it under CPA's plugin directory. The library basename must be `model-retry-wrapper` so CPA maps it to `plugins.configs.model-retry-wrapper`.
 
 Release archives contain the expected platform filename:

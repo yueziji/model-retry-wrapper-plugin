@@ -9,7 +9,7 @@ on:
       version:
         description: "Release version tag"
         required: true
-        default: "v0.0.11"
+        default: "v0.0.13"
 
 permissions:
   contents: write
@@ -44,12 +44,18 @@ jobs:
         include:
           - os: windows-latest
             target: windows-amd64
+            goos: windows
+            goarch: amd64
             ext: dll
           - os: ubuntu-latest
             target: linux-amd64
+            goos: linux
+            goarch: amd64
             ext: so
           - os: macos-latest
             target: darwin-arm64
+            goos: darwin
+            goarch: arm64
             ext: dylib
 
     steps:
@@ -80,13 +86,18 @@ jobs:
           if (Test-Path -LiteralPath $header) {
             $files += $header
           }
-          Compress-Archive -Path $files -DestinationPath "dist/${{ env.PLUGIN_NAME }}-${{ matrix.target }}.zip" -Force
+          $versionTag = "${{ github.event_name == 'workflow_dispatch' && inputs.version || github.ref_name }}"
+          $version = $versionTag.TrimStart("v")
+          $cpaArchive = "dist/${{ env.PLUGIN_NAME }}_${version}_${{ matrix.goos }}_${{ matrix.goarch }}.zip"
+          $legacyArchive = "dist/${{ env.PLUGIN_NAME }}-${{ matrix.target }}.zip"
+          Compress-Archive -Path $files -DestinationPath $cpaArchive -Force
+          Copy-Item -LiteralPath $cpaArchive -Destination $legacyArchive -Force
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: release-assets-${{ matrix.target }}
-          path: dist/${{ env.PLUGIN_NAME }}-${{ matrix.target }}.zip
+          path: dist/*.zip
           if-no-files-found: error
 
   release:
@@ -109,10 +120,15 @@ jobs:
           path: release-assets
           merge-multiple: true
 
+      - name: Generate checksums
+        run: |
+          cd release-assets
+          sha256sum *.zip > checksums.txt
+
       - name: Publish GitHub release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.event_name == 'workflow_dispatch' && inputs.version || github.ref_name }}
           target_commitish: ${{ github.sha }}
-          files: release-assets/*.zip
+          files: release-assets/*
           generate_release_notes: true

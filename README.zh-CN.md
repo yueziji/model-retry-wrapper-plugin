@@ -16,6 +16,23 @@
 
 ## 配置
 
+### 通过 CPA 自定义插件源安装
+
+支持 `plugins.store-sources` 的 CPA 版本可以发现本插件、检查 GitHub 最新 Release，并从管理中心安装或更新。把本仓库的 registry 地址加入 CPA 配置：
+
+```yaml
+plugins:
+  enabled: true
+  store-sources:
+    - "https://raw.githubusercontent.com/yueziji/model-retry-wrapper-plugin/master/registry.json"
+```
+
+然后在 CPA 插件商店中选择 **Model Retry Wrapper** 进行安装或更新。`v0.0.13` 及后续 Release 会提供 CPA 要求的标准平台归档和 `checksums.txt`，用于校验后安装。CPA 会提示存在新版本，但应用更新仍需要在管理中心明确操作，不会在后台无人值守地自动替换插件。
+
+安装后仍需按下面的示例，在 `plugins.configs.model-retry-wrapper.models` 中至少配置一个模型；没有配置模型时，插件会按设计跳过所有请求。
+
+### 手动安装
+
 从 `v0.0.11` 或更新版本的 GitHub Release 下载对应平台的资产，解压后把动态库放到 CPA 的插件目录。动态库文件名主体必须是 `model-retry-wrapper`，这样 CPA 才会把它映射到 `plugins.configs.model-retry-wrapper`。
 
 Release 归档内包含对应平台的文件名：
