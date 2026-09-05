@@ -485,10 +485,14 @@ func runModelStreamWithRetry(ctx context.Context, req rpcExecutorRequest) error 
 		}
 		status, firstPayload, streamID, errStart := startHostModelStream(req)
 		if errStart == nil && !shouldRetryStatus(cfg, status) {
+			diagnostics := &streamDiagnostics{attempt: attempt}
+			diagnostics.observe(firstPayload)
 			fields := retryLogFields(req, cfg, attempt, status, true)
 			fields["first_payload"] = len(firstPayload) > 0
-			pluginLog(req.HostCallbackID, "debug", "model-retry-wrapper: stream startup completed without retry", fields)
-			return forwardHostStream(ctx, streamID, firstPayload, req)
+			message := fmt.Sprintf("model-retry-wrapper: stream startup completed without retry status=%d first_payload=%t entry_protocol=%s exit_protocol=%s %s",
+				status, len(firstPayload) > 0, diagnosticProtocol(entryProtocol(req.ExecutorRequest)), diagnosticProtocol(exitProtocol(req.ExecutorRequest)), diagnostics.summary())
+			pluginLog(req.HostCallbackID, "debug", message, fields)
+			return forwardHostStream(ctx, streamID, firstPayload, req, cfg, diagnostics)
 		}
 		if streamID != "" {
 			_ = closeTrackedHostModelStream(streamID)
@@ -597,30 +601,35 @@ func startHostModelStream(req rpcExecutorRequest) (int, []byte, string, error) {
 	}
 }
 
-func forwardHostStream(ctx context.Context, hostStreamID string, firstPayload []byte, req rpcExecutorRequest) error {
+func forwardHostStream(ctx context.Context, hostStreamID string, firstPayload []byte, req rpcExecutorRequest, cfg pluginConfig, diagnostics *streamDiagnostics) error {
 	defer func() { _ = closeTrackedHostModelStream(hostStreamID) }()
 	if len(firstPayload) > 0 {
+		diagnostics.emitStarted = true
 		if errEmit := emitPluginStreamChunk(req.StreamID, firstPayload); errEmit != nil {
-			logStreamForwardError(req, "model-retry-wrapper: plugin stream emit failed", "first_payload", hostStreamID, errEmit)
+			logStreamForwardError(req, "model-retry-wrapper: plugin stream emit failed", "first_payload", hostStreamID, errEmit, cfg, diagnostics)
 			return errEmit
 		}
+		diagnostics.recordEmitted(firstPayload)
 	}
 	for {
 		chunk, errRead := readHostModelStream(hostStreamID)
 		if errRead != nil {
-			logStreamForwardError(req, "model-retry-wrapper: host stream read failed", "read", hostStreamID, errRead)
+			logStreamForwardError(req, "model-retry-wrapper: host stream read failed", "read", hostStreamID, errRead, cfg, diagnostics)
 			return errRead
 		}
+		diagnostics.observe(chunk.Payload)
 		if chunk.Error != "" {
 			errChunk := fmt.Errorf("%s", chunk.Error)
-			logStreamForwardError(req, "model-retry-wrapper: host stream returned error", "error_chunk", hostStreamID, errChunk)
+			logStreamForwardError(req, "model-retry-wrapper: host stream returned error", "error_chunk", hostStreamID, errChunk, cfg, diagnostics)
 			return errChunk
 		}
 		if len(chunk.Payload) > 0 {
+			diagnostics.emitStarted = true
 			if errEmit := emitPluginStreamChunk(req.StreamID, chunk.Payload); errEmit != nil {
-				logStreamForwardError(req, "model-retry-wrapper: plugin stream emit failed", "payload", hostStreamID, errEmit)
+				logStreamForwardError(req, "model-retry-wrapper: plugin stream emit failed", "payload", hostStreamID, errEmit, cfg, diagnostics)
 				return errEmit
 			}
+			diagnostics.recordEmitted(chunk.Payload)
 		}
 		if chunk.Done {
 			return nil
@@ -633,11 +642,13 @@ func forwardHostStream(ctx context.Context, hostStreamID string, firstPayload []
 	}
 }
 
-func logStreamForwardError(req rpcExecutorRequest, message string, source string, hostStreamID string, err error) {
+func logStreamForwardError(req rpcExecutorRequest, message string, source string, hostStreamID string, err error, cfg pluginConfig, diagnostics *streamDiagnostics) {
 	level := "warn"
 	if errors.Is(err, errPluginStreamClosed) {
 		level = "debug"
 	}
+	message = streamFailureDiagnostic(message, source, cfg, diagnostics, err)
+	message += fmt.Sprintf(" entry_protocol=%s exit_protocol=%s", diagnosticProtocol(entryProtocol(req.ExecutorRequest)), diagnosticProtocol(exitProtocol(req.ExecutorRequest)))
 	pluginLog(req.HostCallbackID, level, message, map[string]any{
 		"model":            req.Model,
 		"source":           source,

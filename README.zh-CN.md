@@ -101,6 +101,15 @@ codex-api-key:
 
 流式重试只有在第一个 payload 被发送给下游之前才是安全的。该插件会启动宿主流，读取到第一个 payload 为止，并重试配置范围内的启动错误。一旦第一个 payload 已发送给下游客户端，后续流错误会作为流错误继续转发，而不会再次重试。
 
+流启动的 debug 日志和后续流错误日志会在消息正文中显示诊断摘要，因此 CPA 的固定字段日志格式也能显示这些信息：
+
+- `attempt`、`status`、`entry_protocol`、`exit_protocol`：当前尝试、错误或启动状态及协议。
+- `received_chunks` / `received_bytes`、`emitted_chunks` / `emitted_bytes`：观察到的非空 payload 和宿主确认发送成功的 payload 数量、字节数。`emit_started=true` 只表示已经尝试向下游写入，不保证客户端已收到。
+- `payloads`：前 8 个非空 payload 的大小和已知事件类型。每个最多检查 16 KiB、记录 8 种事件类型，不记录正文、工具参数、响应 ID 或任意上游事件名。`samples_truncated=true` 表示后续 payload 未采样；单个 payload 的 `truncated=true` 表示达到大小或类型数上限。拆分到不同 payload 的事件不会被拼接，可能显示 `sse.partial_frame`、`incomplete_or_unclassified_json` 或 `unclassified`，因此摘要不能证明完整流中没有实际内容。
+- `retry_skipped=downstream_started`：已进入下游发送阶段，当前错误不再触发重试。写入失败时显示 `downstream_emit_failed`；尚未尝试写入的流转发错误显示 `stream_forwarding`。`keyword_match` 仅表示错误文本包含配置关键词；`startup_retry_eligible` 表示如果错误发生在启动阶段，按当前状态码、关键词和尝试次数规则是否允许重试，不代表实际发起了重试，也不包含取消和总时限检查。
+
+这些诊断不缓存或改写转发内容，也不扩大重试窗口。
+
 ## 构建
 
 构建需要 Go 1.26 或更新版本、启用 CGO，并安装目标平台可用的 C 编译工具链。

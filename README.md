@@ -101,6 +101,15 @@ The plugin matches the alias, wraps the host execution path, and lets the existi
 
 Streaming retries are safe only before the first payload is emitted downstream. This plugin starts the host stream, reads until it sees the first payload, and retries configured startup errors. Once the first payload is emitted to the downstream client, later stream errors are forwarded as stream errors instead of being retried.
 
+The startup debug log and subsequent stream error logs include diagnostics in the message text so that CPA's fixed-field log formatter displays them:
+
+- `attempt`, `status`, `entry_protocol`, and `exit_protocol` identify the attempt, error or startup status, and protocols.
+- `received_chunks` / `received_bytes` and `emitted_chunks` / `emitted_bytes` count observed nonempty payloads and payloads whose host emit calls succeeded. `emit_started=true` means a downstream write was attempted, not that the client received it.
+- `payloads` summarizes sizes and known event types for the first 8 nonempty payloads. Inspection is capped at 16 KiB and 8 distinct event labels per payload. Content, tool arguments, response IDs, and arbitrary upstream event names are never included. `samples_truncated=true` means later payloads were not sampled; a payload's `truncated=true` marks the byte or label cap. Events split across payloads are not reassembled and may appear as `sse.partial_frame`, `incomplete_or_unclassified_json`, or `unclassified`, so a summary cannot establish that the entire stream contained no actual content.
+- `retry_skipped=downstream_started` explains why a forwarding error is not retried. Emit failures use `downstream_emit_failed`; forwarding errors before any write attempt use `stream_forwarding`. `keyword_match` only reports a configured substring match. `startup_retry_eligible` reports whether the status, keyword, and attempt-count rules would allow retrying a startup error; it does not indicate an actual retry or account for cancellation and elapsed-time limits.
+
+Diagnostics do not buffer or rewrite forwarded content or extend the retry window.
+
 ## Build
 
 Builds require Go 1.26 or newer, CGO enabled, and a C toolchain for the target platform.
