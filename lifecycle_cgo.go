@@ -16,7 +16,6 @@ type pluginLifecycleState struct {
 	closed            bool
 	streamTasks       sync.WaitGroup
 	activeHostStreams map[string]struct{}
-	streamRetryWakers map[string]chan struct{}
 	activeRequests    map[string]*requestCancellation
 	pendingCancels    map[string]time.Time
 }
@@ -38,7 +37,6 @@ func newPluginLifecycleState() *pluginLifecycleState {
 		ctx:               ctx,
 		cancel:            cancel,
 		activeHostStreams: make(map[string]struct{}),
-		streamRetryWakers: make(map[string]chan struct{}),
 		activeRequests:    make(map[string]*requestCancellation),
 		pendingCancels:    make(map[string]time.Time),
 	}
@@ -57,7 +55,6 @@ func (s *pluginLifecycleState) reopen() {
 	s.closed = false
 	s.streamTasks = sync.WaitGroup{}
 	s.activeHostStreams = make(map[string]struct{})
-	s.streamRetryWakers = make(map[string]chan struct{})
 	s.activeRequests = make(map[string]*requestCancellation)
 	s.pendingCancels = make(map[string]time.Time)
 }
@@ -208,49 +205,6 @@ func (s *pluginLifecycleState) untrackHostStream(streamID string) {
 	s.mu.Lock()
 	delete(s.activeHostStreams, streamID)
 	s.mu.Unlock()
-}
-
-// registerStreamRetryWaker exposes a channel that terminal lifecycle events pulse
-// so a stream retry loop waiting out its backoff can probe immediately instead of
-// on the next periodic tick. The returned cleanup must be called when the loop exits.
-func (s *pluginLifecycleState) registerStreamRetryWaker(pluginStreamID string) (<-chan struct{}, func()) {
-	if s == nil || pluginStreamID == "" {
-		return nil, func() {}
-	}
-	waker := make(chan struct{}, 1)
-	s.mu.Lock()
-	if s.streamRetryWakers == nil {
-		s.streamRetryWakers = make(map[string]chan struct{})
-	}
-	s.streamRetryWakers[pluginStreamID] = waker
-	s.mu.Unlock()
-	return waker, func() {
-		s.mu.Lock()
-		if s.streamRetryWakers[pluginStreamID] == waker {
-			delete(s.streamRetryWakers, pluginStreamID)
-		}
-		s.mu.Unlock()
-	}
-}
-
-// wakeStreamRetryWaiters is a fallback broadcast. Each woken loop re-probes its
-// own plugin stream and only exits if that stream is really gone.
-func (s *pluginLifecycleState) wakeStreamRetryWaiters() {
-	if s == nil {
-		return
-	}
-	s.mu.Lock()
-	wakers := make([]chan struct{}, 0, len(s.streamRetryWakers))
-	for _, waker := range s.streamRetryWakers {
-		wakers = append(wakers, waker)
-	}
-	s.mu.Unlock()
-	for _, waker := range wakers {
-		select {
-		case waker <- struct{}{}:
-		default:
-		}
-	}
 }
 
 func (s *pluginLifecycleState) shutdown(closeHostStream func(string) error) {

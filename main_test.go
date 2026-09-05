@@ -262,60 +262,20 @@ func TestRetryContextAllowsUnboundedElapsedTime(t *testing.T) {
 	}
 }
 
-func TestWaitRetryDelayWithProbeStopsOnProbeError(t *testing.T) {
-	want := errors.New("stream closed")
-	calls := 0
-	err := waitRetryDelayWithProbe(context.Background(), time.Millisecond, nil, func() error {
-		calls++
-		if calls > 1 {
-			return want
-		}
-		return nil
-	})
-	if !errors.Is(err, want) {
-		t.Fatalf("waitRetryDelayWithProbe() error = %v, want %v", err, want)
-	}
-	if calls != 2 {
-		t.Fatalf("probe calls = %d, want 2", calls)
-	}
-}
-
-func TestWaitRetryDelayWithProbeWakesEarlyOnLifecycleEvent(t *testing.T) {
-	closed := errors.New("stream closed")
-	wake := make(chan struct{}, 1)
-	calls := 0
-	start := time.Now()
+func TestWaitRetryDelayStopsOnContextCancel(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
 	go func() {
 		time.Sleep(10 * time.Millisecond)
-		wake <- struct{}{}
+		cancel()
 	}()
-	err := waitRetryDelayWithProbe(context.Background(), time.Minute, wake, func() error {
-		calls++
-		if calls > 1 {
-			return closed
-		}
-		return nil
-	})
-	if !errors.Is(err, closed) {
-		t.Fatalf("waitRetryDelayWithProbe() error = %v, want %v", err, closed)
-	}
-	if elapsed := time.Since(start); elapsed >= 900*time.Millisecond {
-		t.Fatalf("wake took %v, expected early wake before the 1s periodic probe", elapsed)
-	}
-}
 
-func TestWaitRetryDelayWithProbeKeepsWaitingWhenWakeProbesClean(t *testing.T) {
-	wake := make(chan struct{}, 1)
-	wake <- struct{}{}
 	start := time.Now()
-	err := waitRetryDelayWithProbe(context.Background(), 30*time.Millisecond, wake, func() error {
-		return nil
-	})
-	if err != nil {
-		t.Fatalf("waitRetryDelayWithProbe() error = %v, want nil", err)
+	err := waitRetryDelay(ctx, time.Minute)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("waitRetryDelay() error = %v, want context canceled", err)
 	}
-	if elapsed := time.Since(start); elapsed < 30*time.Millisecond {
-		t.Fatalf("returned after %v, want the full 30ms backoff despite a clean wake", elapsed)
+	if elapsed := time.Since(start); elapsed >= time.Second {
+		t.Fatalf("canceled retry wait took %v, want it to stop promptly", elapsed)
 	}
 }
 
@@ -514,57 +474,30 @@ func TestConfigureStoresNegotiatedSchemaVersion(t *testing.T) {
 	}
 }
 
-func TestWakeStreamRetryWaitersPulsesEveryRegisteredWaker(t *testing.T) {
-	state := newPluginLifecycleState()
-	wakeA, cleanupA := state.registerStreamRetryWaker("stream-a")
-	defer cleanupA()
-	wakeB, cleanupB := state.registerStreamRetryWaker("stream-b")
-
-	state.wakeStreamRetryWaiters()
-	select {
-	case <-wakeA:
-	default:
-		t.Fatal("waker A was not pulsed")
+func TestHandleRequestCompleteCancelsOnTerminalOutcomes(t *testing.T) {
+	previousLifecycle := pluginLifecycle
+	pluginLifecycle = newPluginLifecycleState()
+	defer func() {
+		pluginLifecycle.shutdown(nil)
+		pluginLifecycle = previousLifecycle
+	}()
+	ctx, cleanup, errRegister := pluginLifecycle.registerRequest(nil, "req-1")
+	if errRegister != nil {
+		t.Fatalf("registerRequest() error = %v", errRegister)
 	}
-	select {
-	case <-wakeB:
-	default:
-		t.Fatal("waker B was not pulsed")
-	}
-
-	// Repeated wakes must not block even when nobody drains the channel.
-	state.wakeStreamRetryWaiters()
-	state.wakeStreamRetryWaiters()
-
-	cleanupB()
-	state.wakeStreamRetryWaiters()
-	select {
-	case <-wakeA:
-	default:
-		t.Fatal("waker A was not pulsed after B unregistered")
-	}
-}
-
-func TestHandleRequestCompleteWakesWaitersOnTerminalOutcomes(t *testing.T) {
-	wake, cleanup := pluginLifecycle.registerStreamRetryWaker("stream-complete-test")
 	defer cleanup()
 
 	if _, err := handleRequestComplete([]byte(`{"Outcome":"canceled","RequestID":"req-1"}`)); err != nil {
 		t.Fatalf("handleRequestComplete() error = %v", err)
 	}
 	select {
-	case <-wake:
+	case <-ctx.Done():
 	default:
-		t.Fatal("canceled completion did not wake stream retry waiters")
+		t.Fatal("canceled completion did not cancel the matching request")
 	}
 
 	if _, err := handleRequestComplete([]byte(`{"Outcome":"succeeded"}`)); err != nil {
 		t.Fatalf("handleRequestComplete() error = %v", err)
-	}
-	select {
-	case <-wake:
-		t.Fatal("succeeded completion should not wake stream retry waiters")
-	default:
 	}
 }
 

@@ -314,44 +314,6 @@ func waitRetryDelay(ctx context.Context, delay time.Duration) error {
 	}
 }
 
-func waitRetryDelayWithProbe(ctx context.Context, delay time.Duration, wake <-chan struct{}, probe func() error) error {
-	if probe != nil {
-		if err := probe(); err != nil {
-			return err
-		}
-	}
-	if delay <= 0 {
-		return nil
-	}
-	deadline := time.Now().Add(delay)
-	for {
-		remaining := time.Until(deadline)
-		if remaining <= 0 {
-			return nil
-		}
-		step := remaining
-		if step > time.Second {
-			step = time.Second
-		}
-		timer := time.NewTimer(step)
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-			return ctx.Err()
-		case <-wake:
-			// Terminal lifecycle event: probe now. A clean probe means the event
-			// belonged to another request; keep waiting out the original backoff.
-			timer.Stop()
-		case <-timer.C:
-		}
-		if probe != nil {
-			if err := probe(); err != nil {
-				return err
-			}
-		}
-	}
-}
-
 func logFieldsWith(fields map[string]any, key string, value any) map[string]any {
 	next := make(map[string]any, len(fields)+1)
 	for k, v := range fields {

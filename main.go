@@ -259,8 +259,7 @@ func interceptRequest(raw []byte) ([]byte, error) {
 
 // handleRequestComplete receives asynchronous terminal request events from the host.
 // The request interceptor carries RequestID into the executor request so a
-// completion event can cancel exactly one in-flight retry. Stream waiters are
-// still woken as a fallback for hosts/requests that have no correlation header.
+// completion event can cancel exactly one in-flight retry.
 func handleRequestComplete(raw []byte) ([]byte, error) {
 	var req rpcRequestCompletion
 	if len(raw) > 0 {
@@ -276,7 +275,6 @@ func handleRequestComplete(raw []byte) ([]byte, error) {
 		}
 		remember := req.Outcome == pluginapi.RequestCompletionCanceled && shouldRoute(loadedConfig(), req.SourceFormat, requestedModel)
 		canceled := pluginLifecycle.cancelRequest(req.RequestID, remember)
-		pluginLifecycle.wakeStreamRetryWaiters()
 		pluginLog(req.HostCallbackID, "debug", "model-retry-wrapper: terminal request event", map[string]any{
 			"request_id": req.RequestID,
 			"trace_id":   req.TraceID,
@@ -479,16 +477,11 @@ func runModelStreamWithRetry(ctx context.Context, req rpcExecutorRequest) error 
 	cfg := loadedConfig()
 	ctx, cancel := retryContext(ctx, cfg)
 	defer cancel()
-	wake, unregisterWaker := pluginLifecycle.registerStreamRetryWaker(req.StreamID)
-	defer unregisterWaker()
 	pluginLog(req.HostCallbackID, "info", "model-retry-wrapper: stream retry executor start", retryLogFields(req, cfg, 0, 0, true))
 	var lastErr error
 	for attempt := 1; ; attempt++ {
 		if errContext := ctx.Err(); errContext != nil {
 			return retryTerminationError(lastErr, errContext)
-		}
-		if errProbe := probePluginStreamOpen(req.StreamID); errProbe != nil {
-			return errProbe
 		}
 		status, firstPayload, streamID, errStart := startHostModelStream(req)
 		if errStart == nil && !shouldRetryStatus(cfg, status) {
@@ -521,9 +514,7 @@ func runModelStreamWithRetry(ctx context.Context, req rpcExecutorRequest) error 
 		delay := retryDelay(cfg, attempt)
 		fields["delay_ms"] = durationMillis(delay)
 		pluginLog(req.HostCallbackID, "warn", "model-retry-wrapper: retrying stream startup", fields)
-		if errWait := waitRetryDelayWithProbe(ctx, delay, wake, func() error {
-			return probePluginStreamOpen(req.StreamID)
-		}); errWait != nil {
+		if errWait := waitRetryDelay(ctx, delay); errWait != nil {
 			pluginLog(req.HostCallbackID, "warn", "model-retry-wrapper: stream retry wait canceled", logFieldsWith(fields, "error", shortError(errWait)))
 			return retryTerminationError(lastErr, errWait)
 		}
@@ -684,17 +675,6 @@ func emitPluginStreamChunk(streamID string, payload []byte) error {
 		return fmt.Errorf("plugin stream id is required")
 	}
 	_, errCall := callHost(pluginabi.MethodHostStreamEmit, rpcStreamEmitRequest{StreamID: streamID, Payload: payload})
-	if errCall != nil {
-		return fmt.Errorf("%w: %v", errPluginStreamClosed, errCall)
-	}
-	return nil
-}
-
-func probePluginStreamOpen(streamID string) error {
-	if strings.TrimSpace(streamID) == "" {
-		return nil
-	}
-	_, errCall := callHost(pluginabi.MethodHostStreamEmit, rpcStreamEmitRequest{StreamID: streamID})
 	if errCall != nil {
 		return fmt.Errorf("%w: %v", errPluginStreamClosed, errCall)
 	}
