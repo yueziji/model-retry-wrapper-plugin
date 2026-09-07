@@ -29,6 +29,9 @@ var hostSchemaVersion atomic.Uint32
 // interceptor and removed before the nested host model call reaches upstream.
 const retryRequestIDHeader = "X-Model-Retry-Wrapper-Request-Id"
 
+// The marker survives other plugins' host callbacks so this wrapper runs once per chain.
+const retryAppliedHeader = "X-Model-Retry-Wrapper-Applied"
+
 const maxRequestIDLength = 128
 
 type lifecycleRequest struct {
@@ -51,7 +54,7 @@ type pluginConfig struct {
 type statusCodeList []int
 
 func supportedExecutorFormats() []string {
-	return []string{"openai", "openai-response", "claude", "gemini", "chat-completions"}
+	return []string{"openai", "openai-response", "claude", "gemini", "chat-completions", "codex"}
 }
 
 type retryStatusError struct {
@@ -253,6 +256,11 @@ func retryKeywordFromError(cfg pluginConfig, err error) string {
 		return ""
 	}
 	text := normalizeKey(err.Error())
+	var startupErr *streamStartupError
+	if errors.As(err, &startupErr) {
+		// Match the upstream details in memory; Error() deliberately omits them from logs.
+		text = normalizeKey(startupErr.details)
+	}
 	if text == "" {
 		return ""
 	}
@@ -571,6 +579,33 @@ func stripRequestIDHeader(headers http.Header) http.Header {
 			delete(cloned, key)
 		}
 	}
+	return cloned
+}
+
+func hasRetryMarker(headers http.Header) bool {
+	for key, values := range headers {
+		if strings.EqualFold(key, retryAppliedHeader) {
+			for _, value := range values {
+				if strings.TrimSpace(value) == "1" {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+func nestedRequestHeaders(headers http.Header) http.Header {
+	cloned := stripRequestIDHeader(headers)
+	if cloned == nil {
+		cloned = make(http.Header)
+	}
+	for key := range cloned {
+		if strings.EqualFold(key, retryAppliedHeader) {
+			delete(cloned, key)
+		}
+	}
+	cloned.Set(retryAppliedHeader, "1")
 	return cloned
 }
 

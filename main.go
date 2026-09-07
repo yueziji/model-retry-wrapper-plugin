@@ -244,7 +244,7 @@ func interceptRequest(raw []byte) ([]byte, error) {
 	if strings.TrimSpace(requestedModel) == "" {
 		requestedModel = req.Model
 	}
-	if !lifecycleEventsSupported(hostSchemaVersion.Load()) || requestID == "" || !shouldRoute(cfg, req.SourceFormat, requestedModel) {
+	if !lifecycleEventsSupported(hostSchemaVersion.Load()) || requestID == "" || hasRetryMarker(req.Headers) || !shouldRoute(cfg, req.SourceFormat, requestedModel) {
 		return okEnvelope(pluginapi.RequestInterceptResponse{})
 	}
 	headers := cloneHeader(req.Headers)
@@ -292,6 +292,9 @@ func routeModel(raw []byte) ([]byte, error) {
 	var req rpcModelRouteRequest
 	if errUnmarshal := json.Unmarshal(raw, &req); errUnmarshal != nil {
 		return nil, errUnmarshal
+	}
+	if hasRetryMarker(req.Headers) {
+		return okEnvelope(pluginapi.ModelRouteResponse{Handled: false, Reason: "already_wrapped"})
 	}
 	cfg := loadedConfig()
 	routeFields := map[string]any{
@@ -484,6 +487,9 @@ func runModelStreamWithRetry(ctx context.Context, req rpcExecutorRequest) error 
 			return retryTerminationError(lastErr, errContext)
 		}
 		status, firstPayload, streamID, errStart := startHostModelStream(req)
+		if errStart == nil {
+			errStart = retryableStreamStartupError(cfg, attempt, exitProtocol(req.ExecutorRequest), firstPayload)
+		}
 		if errStart == nil && !shouldRetryStatus(cfg, status) {
 			diagnostics := &streamDiagnostics{attempt: attempt}
 			diagnostics.observe(firstPayload)
@@ -533,7 +539,7 @@ func callHostModelExecute(req rpcExecutorRequest) (pluginapi.HostModelExecutionR
 			Model:         req.Model,
 			Stream:        false,
 			Body:          requestBody(req.ExecutorRequest),
-			Headers:       cloneHeader(req.Headers),
+			Headers:       nestedRequestHeaders(req.Headers),
 			Query:         cloneValues(req.Query),
 			Alt:           req.Alt,
 		},
@@ -560,7 +566,7 @@ func startHostModelStream(req rpcExecutorRequest) (int, []byte, string, error) {
 			Model:         req.Model,
 			Stream:        true,
 			Body:          requestBody(req.ExecutorRequest),
-			Headers:       cloneHeader(req.Headers),
+			Headers:       nestedRequestHeaders(req.Headers),
 			Query:         cloneValues(req.Query),
 			Alt:           req.Alt,
 		},
@@ -583,22 +589,13 @@ func startHostModelStream(req rpcExecutorRequest) (int, []byte, string, error) {
 		_ = closeHostModelStream(resp.StreamID)
 		return 0, nil, "", errTrack
 	}
-	for {
-		chunk, errRead := readHostModelStream(resp.StreamID)
-		if errRead != nil {
-			return statusFromError(errRead), nil, resp.StreamID, errRead
-		}
-		if chunk.Error != "" {
-			errChunk := fmt.Errorf("%s", chunk.Error)
-			return statusFromError(errChunk), nil, resp.StreamID, errChunk
-		}
-		if len(chunk.Payload) > 0 {
-			return http.StatusOK, chunk.Payload, resp.StreamID, nil
-		}
-		if chunk.Done {
-			return http.StatusOK, nil, resp.StreamID, nil
-		}
+	firstPayload, errRead := readStreamStartupPayload(exitProtocol(req.ExecutorRequest), func() (pluginapi.HostModelStreamReadResponse, error) {
+		return readHostModelStream(resp.StreamID)
+	})
+	if errRead != nil {
+		return statusFromError(errRead), nil, resp.StreamID, errRead
 	}
+	return http.StatusOK, firstPayload, resp.StreamID, nil
 }
 
 func forwardHostStream(ctx context.Context, hostStreamID string, firstPayload []byte, req rpcExecutorRequest, cfg pluginConfig, diagnostics *streamDiagnostics) error {

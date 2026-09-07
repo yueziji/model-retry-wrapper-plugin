@@ -110,6 +110,14 @@ The startup debug log and subsequent stream error logs include diagnostics in th
 
 Diagnostics do not buffer or rewrite forwarded content or extend the retry window.
 
+## Using with CodexComp
+
+The wrapper declares native `codex` input/output support. Set **this wrapper's priority higher than CodexComp's** (for example, `30` if CodexComp uses `1`), and include the requested model in both plugins' model lists. The intended order is client → retry wrapper → CodexComp → native model executor. The wrapper adds a per-request `X-Model-Retry-Wrapper-Applied: 1` header to its host callbacks and declines requests carrying that marker, including CodexComp continuation callbacks. This prevents the two routers from repeatedly wrapping each other. A lower wrapper priority can still wrap CodexComp twice; use the documented order to avoid that extra fold.
+
+The request body, `encrypted_content`, `prompt_cache_key`, and entry/exit protocols are preserved. In Responses/Codex streams, a first `response.failed` or `error` event can trigger the existing status/keyword retry rules before anything is emitted. Inspection holds only an incomplete first event, up to 16 KiB; a normal first event or keepalive ends inspection immediately. Non-retryable errors and exhausted attempts are forwarded unchanged. Error details are used for keyword matching in memory and are omitted from retry diagnostics.
+
+CPA's `codex.stream-bootstrap-buffering` may be enabled independently. CPA can retry startup failures inside each continuation round; the outer wrapper never restarts a response after its first payload is emitted. Initial SSE events can arrive later with CPA buffering enabled.
+
 ## Build
 
 Builds require Go 1.26 or newer, CGO enabled, and a C toolchain for the target platform.

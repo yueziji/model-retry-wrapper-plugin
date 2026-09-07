@@ -234,7 +234,7 @@ func diagnosticEventType(value string) string {
 
 func diagnosticProtocol(value string) string {
 	switch value := normalizeSourceFormat(value); value {
-	case "openai", "openai-response", "claude", "gemini", "chat-completions":
+	case "openai", "openai-response", "claude", "gemini", "chat-completions", "codex":
 		return value
 	default:
 		return "unknown"
