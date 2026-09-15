@@ -214,6 +214,7 @@ func pluginRegistration() registration {
 				{Name: "initial_delay_ms", Type: pluginapi.ConfigFieldTypeInteger, Description: "Positive initial delay before a retry."},
 				{Name: "max_delay_ms", Type: pluginapi.ConfigFieldTypeInteger, Description: "Positive maximum exponential backoff delay."},
 				{Name: "max_elapsed_time_ms", Type: pluginapi.ConfigFieldTypeInteger, Description: "Wall-clock limit for one retry sequence. 0 removes the time limit."},
+				{Name: "model_overrides", Type: pluginapi.ConfigFieldTypeObject, Description: "Per-model retry overrides, keyed by the client-requested name or alias in models. Omitted fields inherit global settings; [] disables a list rule. Example: {\"retry-model\":{\"max_attempts\":3}}"},
 			},
 		},
 		Capabilities: registrationCapability{
@@ -434,7 +435,7 @@ func retryLogFields(req rpcExecutorRequest, cfg pluginConfig, attempt int, statu
 }
 
 func runModelExecuteWithRetry(ctx context.Context, req rpcExecutorRequest) (pluginapi.HostModelExecutionResponse, error) {
-	cfg := loadedConfig()
+	cfg := retryConfigForModel(loadedConfig(), req.Model)
 	ctx, cancel := retryContext(ctx, cfg)
 	defer cancel()
 	pluginLog(req.HostCallbackID, "info", "model-retry-wrapper: retry executor start", retryLogFields(req, cfg, 0, 0, false))
@@ -477,7 +478,7 @@ func runModelExecuteWithRetry(ctx context.Context, req rpcExecutorRequest) (plug
 }
 
 func runModelStreamWithRetry(ctx context.Context, req rpcExecutorRequest) error {
-	cfg := loadedConfig()
+	cfg := retryConfigForModel(loadedConfig(), req.Model)
 	ctx, cancel := retryContext(ctx, cfg)
 	defer cancel()
 	pluginLog(req.HostCallbackID, "info", "model-retry-wrapper: stream retry executor start", retryLogFields(req, cfg, 0, 0, true))

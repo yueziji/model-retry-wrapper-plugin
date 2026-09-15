@@ -72,6 +72,41 @@ plugins:
 
 `status_codes` 是主要重试规则。`retry_keywords` 只作为兜底，用于宿主回调没有提供明确 HTTP 状态的错误，例如 `rate_limited`。省略 `retry_keywords` 会使用默认关键词 `rate_limited`；显式配置 `retry_keywords: []` 则会关闭关键词重试，只按状态码重试。
 
+### 单模型重试设置
+
+在 `plugins.configs.model-retry-wrapper` 下添加 `model_overrides`，即可为模型单独覆盖部分重试参数：
+
+```yaml
+models: [retry-codex-gpt-5.5, retry-claude-sonnet]
+max_attempts: 5
+initial_delay_ms: 500
+max_delay_ms: 10000
+max_elapsed_time_ms: 60000
+model_overrides:
+  retry-codex-gpt-5.5:
+    max_attempts: 3
+    initial_delay_ms: 1000
+    retry_keywords: []
+```
+
+此例中，Codex 别名最多尝试 3 次，首次重试前等待 1 秒，关闭关键词重试，其他参数继承全局；Claude 别名全部继承全局。支持独立覆盖六项参数：`status_codes`、`retry_keywords`、`max_attempts`、`initial_delay_ms`、`max_delay_ms`、`max_elapsed_time_ms`。省略或设为 `null` 表示继承；显式列表会整体替换全局列表，`[]` 表示关闭对应规则。尝试次数和总时限中的 `0` 仍表示不限，`max_attempts: 1` 表示只发起首次请求，不额外重试。
+
+模型键使用与 `models` 相同的客户端请求名或别名，忽略大小写和首尾空格；空名称和归一化后的重复名称会报错。`models` 仍负责决定插件接管哪些请求，单独添加覆盖项不会启用该模型的路由。移除模型条目、将其设置为 `{}`，或者清空 `model_overrides`，都会恢复相应的全局继承。加载配置时会检查合并后的完整参数，包括初始等待不得大于最大等待。每个请求在开始时固定使用一份最终配置，普通请求和流式启动重试均适用，流式重试边界保持不变。
+
+配套更新的管理前端提供模型表单：选择已配置模型后，各字段可选择跟随全局、自定义、不限或关闭规则，也可以将整个模型恢复为全局设置。高级 JSON 入口继续保留；其他管理前端可使用对象编辑框。下面的示例应填入 **`model_overrides` 的 JSON 编辑框内部**：
+
+```json
+{
+  "retry-codex-gpt-5.5": {
+    "max_attempts": 3,
+    "initial_delay_ms": 1000,
+    "retry_keywords": []
+  }
+}
+```
+
+JSON 编辑框会整体保存这个对象，修改时请保留其他模型的条目。本功能需要更新插件，旧版插件尚未实现 `model_overrides`。
+
 ## 别名模式
 
 只在你希望命中的凭据组上配置重试别名：

@@ -40,15 +40,16 @@ type lifecycleRequest struct {
 }
 
 type pluginConfig struct {
-	Enabled        bool           `yaml:"enabled"`
-	Models         []string       `yaml:"models"`
-	SourceFormats  []string       `yaml:"source_formats"`
-	StatusCodes    statusCodeList `yaml:"status_codes"`
-	RetryKeywords  []string       `yaml:"retry_keywords"`
-	MaxAttempts    int            `yaml:"max_attempts"`
-	InitialDelayMS int            `yaml:"initial_delay_ms"`
-	MaxDelayMS     int            `yaml:"max_delay_ms"`
-	MaxElapsedMS   int            `yaml:"max_elapsed_time_ms"`
+	Enabled        bool                          `yaml:"enabled"`
+	Models         []string                      `yaml:"models"`
+	SourceFormats  []string                      `yaml:"source_formats"`
+	StatusCodes    statusCodeList                `yaml:"status_codes"`
+	RetryKeywords  []string                      `yaml:"retry_keywords"`
+	MaxAttempts    int                           `yaml:"max_attempts"`
+	InitialDelayMS int                           `yaml:"initial_delay_ms"`
+	MaxDelayMS     int                           `yaml:"max_delay_ms"`
+	MaxElapsedMS   int                           `yaml:"max_elapsed_time_ms"`
+	ModelOverrides map[string]modelRetryOverride `yaml:"model_overrides"`
 }
 
 type statusCodeList []int
@@ -141,20 +142,11 @@ func decodeConfig(raw []byte) (pluginConfig, error) {
 	cfg.SourceFormats = normalizeSourceFormatList(cfg.SourceFormats)
 	cfg.StatusCodes = normalizeStatusCodes(cfg.StatusCodes)
 	cfg.RetryKeywords = normalizeStringList(cfg.RetryKeywords)
-	if cfg.MaxAttempts < 0 {
-		return pluginConfig{}, fmt.Errorf("max_attempts must be 0 or greater")
-	}
-	if errValidate := validatePositiveDurationMillis("initial_delay_ms", cfg.InitialDelayMS); errValidate != nil {
+	if errValidate := validateRetryConfig(cfg); errValidate != nil {
 		return pluginConfig{}, errValidate
 	}
-	if errValidate := validatePositiveDurationMillis("max_delay_ms", cfg.MaxDelayMS); errValidate != nil {
+	if errValidate := normalizeModelOverrides(&cfg); errValidate != nil {
 		return pluginConfig{}, errValidate
-	}
-	if errValidate := validateOptionalDurationMillis("max_elapsed_time_ms", cfg.MaxElapsedMS); errValidate != nil {
-		return pluginConfig{}, errValidate
-	}
-	if cfg.InitialDelayMS > cfg.MaxDelayMS {
-		return pluginConfig{}, fmt.Errorf("initial_delay_ms must not exceed max_delay_ms")
 	}
 	return cfg, nil
 }

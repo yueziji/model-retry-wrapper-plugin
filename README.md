@@ -72,6 +72,41 @@ Downstream cancellation stops requests through CPA host callbacks. On hosts that
 
 `status_codes` is the primary retry rule. `retry_keywords` is only a fallback for host callback errors that do not expose an explicit HTTP status, such as `rate_limited`. Omit `retry_keywords` to use the default `rate_limited` fallback; set `retry_keywords: []` to disable keyword retries and use status codes only.
 
+### Per-model retry settings
+
+Add `model_overrides` under `plugins.configs.model-retry-wrapper` to change individual retry settings for selected models:
+
+```yaml
+models: [retry-codex-gpt-5.5, retry-claude-sonnet]
+max_attempts: 5
+initial_delay_ms: 500
+max_delay_ms: 10000
+max_elapsed_time_ms: 60000
+model_overrides:
+  retry-codex-gpt-5.5:
+    max_attempts: 3
+    initial_delay_ms: 1000
+    retry_keywords: []
+```
+
+Here the Codex alias gets up to three attempts, a one-second initial delay, and no keyword retries. Its other fields inherit the global values; the Claude alias uses all global values. The six retry fields (`status_codes`, `retry_keywords`, `max_attempts`, `initial_delay_ms`, `max_delay_ms`, and `max_elapsed_time_ms`) can be overridden independently. Omitted or `null` fields inherit; a supplied list replaces the global list, and `[]` disables that rule. Zero still means unlimited for attempts and elapsed time; `max_attempts: 1` disables additional retries.
+
+Keys use the same client-requested model name or alias as `models`, ignoring case and surrounding whitespace. Blank keys and duplicate normalized keys are rejected. `models` still determines which requests the plugin handles: adding only an override does not enable routing. Removing a model's override, using `{}` for its policy, or clearing `model_overrides` restores inheritance. The complete effective policy is validated at configuration time, including the initial/maximum delay relationship. Each request takes one policy snapshot, used by both normal execution and stream startup retries. The streaming retry boundary is unchanged.
+
+The matching management frontend update offers a per-model form with global inheritance, custom values, unlimited limits, disabled list rules, and a restore-global action. Advanced JSON remains available and other management frontends can use the object editor. Enter the following **inside the `model_overrides` JSON field**:
+
+```json
+{
+  "retry-codex-gpt-5.5": {
+    "max_attempts": 3,
+    "initial_delay_ms": 1000,
+    "retry_keywords": []
+  }
+}
+```
+
+The JSON field is saved as one complete object, so retain entries for other models when editing it. This feature requires updating the plugin; older plugin versions do not implement `model_overrides`.
+
 ## Alias Pattern
 
 Configure the retry alias only on the credential group you want to target:
