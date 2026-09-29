@@ -9,7 +9,7 @@ This Go/cgo native plugin demonstrates a small ModelRouter + executor wrapper fo
 - Routes only explicitly configured client-requested model names or aliases to the plugin executor.
 - Calls the normal host model execution path through `host.model.execute` or `host.model.execute_stream`.
 - Retries configured upstream HTTP status codes in the plugin before returning an error downstream.
-- Can optionally retry configured error-message keywords when the host callback does not include a numeric HTTP status.
+- Can optionally retry configured error-message keywords even when the HTTP status does not match the configured status codes.
 - Skips its own router on nested host model callbacks, so the wrapper does not recurse into itself.
 
 The plugin is intended for explicit retry aliases such as `retry-codex-gpt-5.5` or `retry-claude-sonnet`. Requests for normal model names are left untouched unless those names are listed in `models`.
@@ -70,7 +70,9 @@ plugins:
 
 Downstream cancellation stops requests through CPA host callbacks. On hosts that support plugin schema version 2, the plugin registers both a request interceptor and a request lifecycle listener. The interceptor carries CPA's host-generated `RequestID` to this plugin's executor through an internal header, which is removed before the nested host model call is sent upstream. Each executor registers its own cancelable context under that ID, so a terminal `canceled`/`failed`/`rejected` event cancels only the matching retry sequence; a short-lived pending cancellation also covers an event that races ahead of executor registration. The retry wait is context-aware and does not write probe chunks into the downstream stream. Older schema-1 hosts keep working unchanged but cannot provide this exact asynchronous correlation. If a downstream client only stops consuming while keeping the HTTP connection open, CPA has no cancellation signal and an unbounded retry sequence will continue; configure `max_attempts` or `max_elapsed_time_ms` for a hard upper bound. Plugin shutdown cancels its background streams and waits for them to stop calling the host. A host callback that is already running cannot be preempted by the plugin, but cancellation prevents another retry after that callback returns. Go also does not guarantee that a `c-shared` library can be safely hot-unloaded in every process.
 
-`status_codes` is the primary retry rule. `retry_keywords` is only a fallback for host callback errors that do not expose an explicit HTTP status, such as `rate_limited`. Omit `retry_keywords` to use the default `rate_limited` fallback; set `retry_keywords: []` to disable keyword retries and use status codes only.
+`status_codes` and `retry_keywords` are alternative retry rules: a matching HTTP status or error-message keyword allows a retry, subject to the attempt limit, elapsed-time limit, cancellation, and streaming boundary. Keywords use case-insensitive substring matching and apply even when an explicit HTTP status is outside `status_codes`; for example, HTTP 400 with `rate_limited` in the error can be retried without adding 400 to `status_codes`. Omit `retry_keywords` to use the default `rate_limited` keyword; set `retry_keywords: []` to disable keyword retries and use status codes only. Set `status_codes: []` to use keywords only, or set both lists to `[]` to disable both rules.
+
+Retry, stop, and canceled-wait log messages include `attempt`, `status`, `status_match`, `keyword_match`, `retry_allowed`, `stop_reason`, `max_attempts`, `max_elapsed_time_ms`, and `retry_keywords_count`. These values use the effective per-model policy and appear in the message text so CPA's text formatter displays them. `stop_reason` is `no_matching_rule`, `max_attempts`, `canceled`, or `deadline_exceeded`; `none` means this decision allows retrying. A deadline can come from the retry time limit or a parent context. The diagnostic summary excludes upstream error bodies and keyword values. A new host may supply a structured HTTP status even when the error message contains no status number.
 
 ### Per-model retry settings
 
@@ -157,10 +159,12 @@ CPA's `codex.stream-bootstrap-buffering` may be enabled independently. CPA can r
 
 Builds require Go 1.26 or newer, CGO enabled, and a C toolchain for the target platform.
 
+The plugin uses CPA SDK `v7.3.20`, native ABI 1, and RPC schema up to 6. Registration negotiates the lower supported schema; hosts omitting a schema retain schema-1 behavior, and request lifecycle capabilities require schema 2 or newer. Schema 6 changes management JSON response escaping and does not alter this wrapper's execution contract. RPC errors use the SDK envelope and preserve structured HTTP status through wrapped errors. Legacy errors without a status still support the existing explicit-status-text and keyword matching rules. The wrapper keeps its own status wrapper where an original Go error must remain available through `errors.Is` / `errors.As`.
+
 From this repository root:
 
 ```bash
-go test .
+go test -mod=readonly ./...
 go build -buildmode=c-shared -o model-retry-wrapper.dll .
 ```
 

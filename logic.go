@@ -230,9 +230,7 @@ func shouldRetryFailure(cfg pluginConfig, attempt int, status int, err error) (b
 	if shouldRetryStatus(cfg, status) {
 		return shouldRetryAttempt(cfg, attempt, status), ""
 	}
-	if status > 0 {
-		return false, ""
-	}
+	// Keywords can independently allow retries when the status rule does not match.
 	keyword := retryKeywordFromError(cfg, err)
 	if keyword == "" {
 		return false, ""

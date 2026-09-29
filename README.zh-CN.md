@@ -9,7 +9,7 @@
 - 只把显式配置的客户端请求模型名或别名路由到插件执行器。
 - 通过 `host.model.execute` 或 `host.model.execute_stream` 调用常规的宿主模型执行路径。
 - 在错误返回下游之前，由插件重试已配置的上游 HTTP 状态码。
-- 当宿主回调没有暴露数字 HTTP 状态码时，可以按配置的错误关键词做兜底重试。
+- 即使 HTTP 状态码没有命中配置，也可以按配置的错误关键词重试。
 - 在嵌套的宿主模型回调中跳过自己的路由器，避免包装器递归调用自身。
 
 该插件适合用于显式的重试别名，例如 `retry-codex-gpt-5.5` 或 `retry-claude-sonnet`。除非普通模型名被列入 `models`，否则针对普通模型名的请求不会被插件处理。
@@ -70,7 +70,9 @@ plugins:
 
 下游取消会通过 CPA 的宿主回调停止请求。在支持插件 schema 版本 2 的宿主上，插件会同时注册请求拦截器和请求生命周期监听器。拦截器通过内部请求头把 CPA 生成的 `RequestID` 传给插件自己的 executor，executor 会在嵌套宿主模型调用前删除该请求头，并按 ID 登记独立的可取消 Context。收到 `canceled`/`failed`/`rejected` 终态事件时，插件只取消对应的重试过程；短时待处理取消记录还会覆盖“终态事件早于 executor 登记”的竞争窗口。重试等待会监听 Context，不再向下游 stream 写入用于探测的空 chunk。旧的 schema 1 宿主行为不变，但无法提供这种精确的异步关联。如果下游程序只是停止读取、但保持 HTTP 连接打开，CPA 收不到取消信号；在无限重试配置下请求会继续，此时应设置 `max_attempts` 或 `max_elapsed_time_ms` 作为硬上限。插件关闭时会取消后台流并等待它们停止回调宿主。插件无法抢占已经执行中的宿主回调，但取消后不会在该回调返回时继续下一轮重试。Go 也不保证 `c-shared` 动态库在所有进程中都能安全热卸载。
 
-`status_codes` 是主要重试规则。`retry_keywords` 只作为兜底，用于宿主回调没有提供明确 HTTP 状态的错误，例如 `rate_limited`。省略 `retry_keywords` 会使用默认关键词 `rate_limited`；显式配置 `retry_keywords: []` 则会关闭关键词重试，只按状态码重试。
+`status_codes` 与 `retry_keywords` 是“或”关系：状态码或错误关键词任一命中，即可在尝试次数、总时限、取消和流式发送边界允许的范围内重试。关键词采用忽略大小写的子串匹配，即使错误带有明确 HTTP 状态码且不在 `status_codes` 中，也会检查关键词；例如 HTTP 400 的错误包含 `rate_limited` 时，无需把 400 加入 `status_codes` 也能重试。省略 `retry_keywords` 会使用默认关键词 `rate_limited`；显式配置 `retry_keywords: []` 则关闭关键词重试，只按状态码重试。配置 `status_codes: []` 可只按关键词重试；两个列表都设为 `[]` 则关闭这两类重试规则。
+
+发起重试、停止重试和等待被取消时，日志正文会显示 `attempt`、`status`、`status_match`、`keyword_match`、`retry_allowed`、`stop_reason`、`max_attempts`、`max_elapsed_time_ms` 和 `retry_keywords_count`，使用当前模型最终生效的配置，CPA 的文本日志格式也能直接显示。`stop_reason` 分别用 `no_matching_rule`、`max_attempts`、`canceled`、`deadline_exceeded` 表示规则未命中、次数耗尽、取消和截止时间到达；`none` 表示本次判断允许重试。截止时间可能来自插件总时限或父级 Context。诊断摘要不复制上游错误正文或关键词内容。新版宿主可能通过独立字段提供 HTTP 状态码，即使错误正文中没有状态数字。
 
 ### 单模型重试设置
 
@@ -157,10 +159,12 @@ CPA 的 `codex.stream-bootstrap-buffering` 可以独立开启。CPA 可以在每
 
 构建需要 Go 1.26 或更新版本、启用 CGO，并安装目标平台可用的 C 编译工具链。
 
+插件使用 CPA SDK `v7.3.20`、原生 ABI 1，最高支持 RPC schema 6。注册时协商双方支持的较低 schema；宿主未提供版本时沿用 schema 1，请求生命周期能力仍要求 schema 2 或更新版本。Schema 6 调整管理接口 JSON 响应的转义方式，不改变本包装器的执行协议。RPC 错误使用 SDK 官方封装，并在 Go 错误包装中保留结构化 HTTP 状态码；旧宿主未提供状态码时，仍按原有的明确状态文本和关键词规则判断。需要通过 `errors.Is` / `errors.As` 保留原始 Go 错误的地方，继续使用插件自身的状态包装器。
+
 在仓库根目录执行：
 
 ```bash
-go test .
+go test -mod=readonly ./...
 go build -buildmode=c-shared -o model-retry-wrapper.dll .
 ```
 

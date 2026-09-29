@@ -182,7 +182,7 @@ func TestStreamFailureDiagnosticExplainsSkippedRetry(t *testing.T) {
 	}{
 		{"keyword after startup", "error_chunk", errRateLimit, true, 1, 0, []string{"retry_skipped=downstream_started", "status=0", "keyword_match=true", "startup_retry_eligible=true", "emitted_chunks=1"}},
 		{"unmatched keyword", "error_chunk", errors.New("private-other-error"), true, 1, 0, []string{"keyword_match=false", "startup_retry_eligible=false"}},
-		{"HTTP status takes precedence", "error_chunk", retryStatusError{status: http.StatusBadRequest, err: errRateLimit}, true, 1, 0, []string{"status=400", "keyword_match=true", "startup_retry_eligible=false"}},
+		{"keyword with unmatched HTTP status", "error_chunk", retryStatusError{status: http.StatusBadRequest, err: errRateLimit}, true, 1, 0, []string{"status=400", "keyword_match=true", "startup_retry_eligible=true", "retry_skipped=downstream_started"}},
 		{"attempt limit", "error_chunk", errRateLimit, true, 1, 1, []string{"keyword_match=true", "startup_retry_eligible=false"}},
 		{"write failure with uncertain delivery", "first_payload", errRateLimit, true, 0, 0, []string{"retry_skipped=downstream_emit_failed", "emit_started=true", "emitted_chunks=0"}},
 		{"forwarding without a first payload", "read", errRateLimit, false, 0, 0, []string{"retry_skipped=stream_forwarding", "emit_started=false", "emitted_chunks=0"}},

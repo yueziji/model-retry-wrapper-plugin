@@ -90,33 +90,57 @@ func TestRetryAttemptHonorsConfiguredStatusAndMaxAttempts(t *testing.T) {
 	}
 }
 
-func TestRetryFailureUsesConfiguredKeywordWhenStatusMissing(t *testing.T) {
+func TestRetryFailureMatchesStatusOrKeyword(t *testing.T) {
 	cfg := defaultPluginConfig()
-	cfg.MaxAttempts = 3
 	err := errors.New(`host_call_failed: {"error":{"message":"rate_limited (request id: test)","type":"new_api_error","code":"rate_limited"}}`)
-
-	shouldRetry, keyword := shouldRetryFailure(cfg, 1, 0, err)
-	if !shouldRetry {
-		t.Fatal("expected keyword fallback to retry")
+	for _, tc := range []struct {
+		name        string
+		status      int
+		keywords    []string
+		attempt     int
+		maxAttempts int
+		wantRetry   bool
+		wantKeyword string
+	}{
+		{"keyword without status", 0, cfg.RetryKeywords, 1, 3, true, "rate_limited"},
+		{"keyword with unmatched status", 400, cfg.RetryKeywords, 1, 3, true, "rate_limited"},
+		{"keyword without attempt cap", 400, cfg.RetryKeywords, 10, 0, true, "rate_limited"},
+		{"keyword at attempt cap", 400, cfg.RetryKeywords, 3, 3, false, "rate_limited"},
+		{"keyword without status at attempt cap", 0, cfg.RetryKeywords, 3, 3, false, "rate_limited"},
+		{"single attempt", 400, cfg.RetryKeywords, 1, 1, false, "rate_limited"},
+		{"status without keyword match", 503, []string{"overloaded"}, 1, 3, true, ""},
+		{"status with keywords disabled", 503, []string{}, 1, 3, true, ""},
+		{"both rules match", 503, cfg.RetryKeywords, 1, 3, true, ""},
+		{"both rules at attempt cap", 503, cfg.RetryKeywords, 3, 3, false, ""},
+		{"neither rule matches", 400, []string{"overloaded"}, 1, 3, false, ""},
+		{"no status or keyword match", 0, []string{"overloaded"}, 1, 3, false, ""},
+		{"unmatched status with keywords disabled", 400, []string{}, 1, 3, false, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := cfg
+			cfg.RetryKeywords = tc.keywords
+			cfg.MaxAttempts = tc.maxAttempts
+			gotRetry, gotKeyword := shouldRetryFailure(cfg, tc.attempt, tc.status, err)
+			if gotRetry != tc.wantRetry || gotKeyword != tc.wantKeyword {
+				t.Fatalf("retry = %v, keyword = %q; want %v, %q", gotRetry, gotKeyword, tc.wantRetry, tc.wantKeyword)
+			}
+		})
 	}
-	if keyword != "rate_limited" {
-		t.Fatalf("keyword = %q, want rate_limited", keyword)
-	}
+}
 
-	shouldRetry, _ = shouldRetryFailure(cfg, 3, 0, err)
-	if shouldRetry {
-		t.Fatal("expected max attempts to stop keyword fallback retry")
-	}
-
-	shouldRetry, keyword = shouldRetryFailure(cfg, 1, http.StatusBadRequest, err)
-	if shouldRetry || keyword != "" {
-		t.Fatalf("status-coded failure retry = %v, keyword = %q; want false, empty", shouldRetry, keyword)
-	}
-
-	cfg.RetryKeywords = []string{"overloaded"}
-	shouldRetry, keyword = shouldRetryFailure(cfg, 1, 0, err)
-	if shouldRetry || keyword != "" {
-		t.Fatalf("non-matching keyword fallback retry = %v, keyword = %q; want false, empty", shouldRetry, keyword)
+func TestKeywordRetryMatchesClaudeSupplyError(t *testing.T) {
+	keyword := "由于 claude 模型供应难以保证，上线 gpt-6-astra-cc-format 模型，支持 messages 格式，通过 claude --model 'gpt-6-astra-cc-format[1m]' 使用该模型"
+	cfg := defaultPluginConfig()
+	cfg.StatusCodes = nil
+	cfg.RetryKeywords = []string{keyword}
+	err := errors.New(`host_call_failed: {"error":"` + keyword + `","type":"error"}`)
+	for _, status := range []int{0, http.StatusBadRequest} {
+		callbackErr := errorWithStatus(err, status)
+		gotStatus := statusFromError(callbackErr)
+		gotRetry, gotKeyword := shouldRetryFailure(cfg, 1, gotStatus, callbackErr)
+		if gotStatus != status || !gotRetry || gotKeyword != keyword {
+			t.Fatalf("status = %d, retry = %v, keyword = %q; want %d, true, %q", gotStatus, gotRetry, gotKeyword, status, keyword)
+		}
 	}
 }
 
@@ -417,6 +441,10 @@ func TestNegotiatedSchemaVersionCapsAtPluginSupport(t *testing.T) {
 		{host: 0, want: 1},
 		{host: 1, want: 1},
 		{host: 2, want: 2},
+		{host: 3, want: 3},
+		{host: 4, want: 4},
+		{host: 5, want: 5},
+		{host: 6, want: 6},
 		{host: 99, want: pluginabi.SchemaVersion},
 	}
 	for _, tt := range tests {
@@ -442,16 +470,15 @@ func TestRegistrationGatesLifecycleCapabilityOnSchemaVersion(t *testing.T) {
 		t.Fatal("request_interceptor advertised to a schema-1 host")
 	}
 
-	hostSchemaVersion.Store(2)
-	reg = pluginRegistration()
-	if reg.SchemaVersion != 2 {
-		t.Fatalf("SchemaVersion = %d, want 2 against a schema-2 host", reg.SchemaVersion)
-	}
-	if !reg.Capabilities.RequestLifecyclePlugin {
-		t.Fatal("request_lifecycle_plugin not advertised to a schema-2 host")
-	}
-	if !reg.Capabilities.RequestInterceptor {
-		t.Fatal("request_interceptor not advertised to a schema-2 host")
+	for _, schema := range []uint32{2, 3, 4, 5, 6} {
+		hostSchemaVersion.Store(schema)
+		reg = pluginRegistration()
+		if reg.SchemaVersion != schema {
+			t.Fatalf("SchemaVersion = %d, want %d", reg.SchemaVersion, schema)
+		}
+		if !reg.Capabilities.RequestLifecyclePlugin || !reg.Capabilities.RequestInterceptor {
+			t.Fatalf("lifecycle capabilities not advertised to a schema-%d host", schema)
+		}
 	}
 }
 

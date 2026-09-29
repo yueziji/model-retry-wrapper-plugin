@@ -25,7 +25,8 @@ func TestRetryableStreamStartupErrors(t *testing.T) {
 		{"overload", `data: {"type":"error","error":{"code":"server_is_overloaded"}}`, 503},
 		{"rate limit", `data: {"type":"error","error":{"type":"rate_limit_error"}}`, 429},
 		{"numeric string code", `data: {"type":"response.failed","response":{"error":{"code":"503"}}}`, 503},
-		{"keyword fallback", `data: {"type":"error","error":{"message":"rate_limited private-detail"}}`, 0},
+		{"keyword without status", `data: {"type":"error","error":{"message":"rate_limited private-detail"}}`, 0},
+		{"keyword with unmatched status", `data: {"type":"error","error":{"type":"invalid_request_error","message":"rate_limited private-detail"}}`, 400},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			for _, format := range []string{"codex", "openai-response"} {
@@ -52,7 +53,7 @@ func TestStreamStartupPreservesNonRetryablePayloads(t *testing.T) {
 		`data: {"type":"response.output_text.delta","delta":"rate_limited"}`,
 		`data: {"type":"response.output_item.added","item":{"type":"reasoning"}}`,
 		`data: {"type":"response.failed","response":{"output":[{"type":"reasoning"}],"error":{"code":502}}}`,
-		`data: {"type":"error","error":{"type":"invalid_request_error","message":"rate_limited"}}`,
+		`data: {"type":"error","error":{"type":"invalid_request_error","message":"invalid request"}}`,
 		`data: {"type":"error","error":{"type":"authentication_error"}}`,
 		`data: {"type":"error","error":{"message":"model-2026 failed"}}`,
 		`data: {"type":"error","error":{"code":200}}`,
