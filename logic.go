@@ -40,16 +40,17 @@ type lifecycleRequest struct {
 }
 
 type pluginConfig struct {
-	Enabled        bool                          `yaml:"enabled"`
-	Models         []string                      `yaml:"models"`
-	SourceFormats  []string                      `yaml:"source_formats"`
-	StatusCodes    statusCodeList                `yaml:"status_codes"`
-	RetryKeywords  []string                      `yaml:"retry_keywords"`
-	MaxAttempts    int                           `yaml:"max_attempts"`
-	InitialDelayMS int                           `yaml:"initial_delay_ms"`
-	MaxDelayMS     int                           `yaml:"max_delay_ms"`
-	MaxElapsedMS   int                           `yaml:"max_elapsed_time_ms"`
-	ModelOverrides map[string]modelRetryOverride `yaml:"model_overrides"`
+	Enabled         bool                          `yaml:"enabled"`
+	Models          []string                      `yaml:"models"`
+	SourceFormats   []string                      `yaml:"source_formats"`
+	StatusCodes     statusCodeList                `yaml:"status_codes"`
+	RetryKeywords   []string                      `yaml:"retry_keywords"`
+	MaxAttempts     int                           `yaml:"max_attempts"`
+	SameAuthRetries int                           `yaml:"same_auth_retries"`
+	InitialDelayMS  int                           `yaml:"initial_delay_ms"`
+	MaxDelayMS      int                           `yaml:"max_delay_ms"`
+	MaxElapsedMS    int                           `yaml:"max_elapsed_time_ms"`
+	ModelOverrides  map[string]modelRetryOverride `yaml:"model_overrides"`
 }
 
 type statusCodeList []int

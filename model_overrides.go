@@ -4,15 +4,19 @@ import "fmt"
 
 // Pointers distinguish inheritance from explicit zero limits and empty lists.
 type modelRetryOverride struct {
-	StatusCodes    *statusCodeList `yaml:"status_codes"`
-	RetryKeywords  *[]string       `yaml:"retry_keywords"`
-	MaxAttempts    *int            `yaml:"max_attempts"`
-	InitialDelayMS *int            `yaml:"initial_delay_ms"`
-	MaxDelayMS     *int            `yaml:"max_delay_ms"`
-	MaxElapsedMS   *int            `yaml:"max_elapsed_time_ms"`
+	StatusCodes     *statusCodeList `yaml:"status_codes"`
+	RetryKeywords   *[]string       `yaml:"retry_keywords"`
+	MaxAttempts     *int            `yaml:"max_attempts"`
+	SameAuthRetries *int            `yaml:"same_auth_retries"`
+	InitialDelayMS  *int            `yaml:"initial_delay_ms"`
+	MaxDelayMS      *int            `yaml:"max_delay_ms"`
+	MaxElapsedMS    *int            `yaml:"max_elapsed_time_ms"`
 }
 
 func validateRetryConfig(cfg pluginConfig) error {
+	if cfg.SameAuthRetries < 0 {
+		return fmt.Errorf("same_auth_retries must be 0 or greater")
+	}
 	if cfg.MaxAttempts < 0 {
 		return fmt.Errorf("max_attempts must be 0 or greater")
 	}
@@ -75,6 +79,9 @@ func applyModelRetryOverride(cfg pluginConfig, override modelRetryOverride) plug
 	}
 	if override.MaxAttempts != nil {
 		cfg.MaxAttempts = *override.MaxAttempts
+	}
+	if override.SameAuthRetries != nil {
+		cfg.SameAuthRetries = *override.SameAuthRetries
 	}
 	if override.InitialDelayMS != nil {
 		cfg.InitialDelayMS = *override.InitialDelayMS

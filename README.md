@@ -91,7 +91,7 @@ model_overrides:
     retry_keywords: []
 ```
 
-Here the Codex alias gets up to three attempts, a one-second initial delay, and no keyword retries. Its other fields inherit the global values; the Claude alias uses all global values. The six retry fields (`status_codes`, `retry_keywords`, `max_attempts`, `initial_delay_ms`, `max_delay_ms`, and `max_elapsed_time_ms`) can be overridden independently. Omitted or `null` fields inherit; a supplied list replaces the global list, and `[]` disables that rule. Zero still means unlimited for attempts and elapsed time; `max_attempts: 1` disables additional retries.
+Here the Codex alias gets up to three attempts, a one-second initial delay, and no keyword retries. Its other fields inherit the global values; the Claude alias uses all global values. The seven retry fields (`status_codes`, `retry_keywords`, `max_attempts`, `same_auth_retries`, `initial_delay_ms`, `max_delay_ms`, and `max_elapsed_time_ms`) can be overridden independently. Omitted or `null` fields inherit; a supplied list replaces the global list, and `[]` disables that rule. Zero still means unlimited for attempts and elapsed time; `max_attempts: 1` disables additional retries.
 
 Keys use the same client-requested model name or alias as `models`, ignoring case and surrounding whitespace. Blank keys and duplicate normalized keys are rejected. `models` still determines which requests the plugin handles: adding only an override does not enable routing. Removing a model's override, using `{}` for its policy, or clearing `model_overrides` restores inheritance. The complete effective policy is validated at configuration time, including the initial/maximum delay relationship. Each request takes one policy snapshot, used by both normal execution and stream startup retries. The streaming retry boundary is unchanged.
 
@@ -108,6 +108,16 @@ The matching management frontend update offers a per-model form with global inhe
 ```
 
 The JSON field is saved as one complete object, so retain entries for other models when editing it. This feature requires updating the plugin; older plugin versions do not implement `model_overrides`.
+
+### Prefer retrying the same credential
+
+Set `same_auth_retries: 2` under `plugins.configs.model-retry-wrapper`, globally or in a `model_overrides` entry. The default `0` retains normal CPA selection. Each selected credential receives its own extra attempts: `2` tries A up to three times, then B up to three times, before falling back to C. Every switch selects the highest-priority remaining available credential; equal-priority candidates are ordered by credential ID. The total attempt and elapsed-time limits still apply; allow at least `max_attempts: 7` (or `0`) for three A attempts, three B attempts and one C attempt. Only status/keyword-matching failures receive extra attempts; other failures for which CPA requested failover proceed directly to the next credential, which still receives its full retry budget.
+
+This uses CPA `v7.3.20`'s existing scheduler and `auth_id` callbacks without modifying CPA. Enabling it advertises a scheduler that handles only live wrapper request tokens and receives available candidates across priority tiers. **This plugin must be CPA's active scheduler plugin.** CPA uses one scheduler plugin at a time, so give this plugin a higher plugin priority than other scheduler plugins. Plugin priority activates the scheduler; credential priority determines the A/B ordering. Older hosts or another active scheduler cannot guarantee this behavior.
+
+CPA's auth refresh, model eligibility and cooldowns still apply. A pinned cooldown waits using `model_cooldown` recovery information or the credential's runtime `next_retry_after` without consuming an extra attempt; the wait counts toward elapsed time and is cancelable. This does not bypass cooldowns. An unselectable credential without a cooldown hint proceeds to fallback. Exhausted or retired credentials stay excluded for the rest of this request; no remaining available candidate returns an error. Each new request selects again by current availability and priority, without cross-request failure counts. Streaming retries stop at the first emitted payload. Auth refresh and native retries can increase actual upstream request counts.
+
+When enabled, additional model calls made by other wrappers before stream startup are also constrained by this request's credential scheduling. The full CodexComp continuation combination has not been verified; initially enable this only for models using native executors directly. The default `0` preserves existing plugin combinations.
 
 ## Alias Pattern
 

@@ -34,19 +34,23 @@ type registration struct {
 }
 
 type registrationCapability struct {
-	ModelRouter            bool     `json:"model_router"`
-	Executor               bool     `json:"executor"`
-	RequestInterceptor     bool     `json:"request_interceptor"`
-	RequestLifecyclePlugin bool     `json:"request_lifecycle_plugin"`
-	ExecutorModelScope     string   `json:"executor_model_scope"`
-	ExecutorInputFormats   []string `json:"executor_input_formats"`
-	ExecutorOutputFormats  []string `json:"executor_output_formats"`
+	Scheduler                 bool     `json:"scheduler"`
+	SchedulerAcrossPriorities bool     `json:"scheduler_across_priorities,omitempty"`
+	ModelRouter               bool     `json:"model_router"`
+	Executor                  bool     `json:"executor"`
+	RequestInterceptor        bool     `json:"request_interceptor"`
+	RequestLifecyclePlugin    bool     `json:"request_lifecycle_plugin"`
+	ExecutorModelScope        string   `json:"executor_model_scope"`
+	ExecutorInputFormats      []string `json:"executor_input_formats"`
+	ExecutorOutputFormats     []string `json:"executor_output_formats"`
 }
 
 type rpcExecutorRequest struct {
 	pluginapi.ExecutorRequest
-	StreamID       string `json:"stream_id,omitempty"`
-	HostCallbackID string `json:"host_callback_id,omitempty"`
+	StreamID           string `json:"stream_id,omitempty"`
+	HostCallbackID     string `json:"host_callback_id,omitempty"`
+	credentialSequence string
+	pinnedAuthID       string
 }
 
 type rpcModelRouteRequest struct {
@@ -167,6 +171,8 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 		return okEnvelope(pluginRegistration())
 	case pluginabi.MethodModelRoute:
 		return routeModel(request)
+	case pluginabi.MethodSchedulerPick:
+		return pickRetryCredential(request)
 	case pluginabi.MethodRequestInterceptBefore, pluginabi.MethodRequestInterceptAfter:
 		return interceptRequest(request)
 	case pluginabi.MethodExecutorIdentifier:
@@ -201,6 +207,7 @@ func pluginRegistration() registration {
 				{Name: "status_codes", Type: pluginapi.ConfigFieldTypeArray, Description: "HTTP status codes retried inside the plugin before downstream delivery."},
 				{Name: "retry_keywords", Type: pluginapi.ConfigFieldTypeArray, Description: "Error substrings that allow retries even when the HTTP status does not match status_codes; an explicit empty list disables keyword retries."},
 				{Name: "max_attempts", Type: pluginapi.ConfigFieldTypeInteger, Description: "Maximum attempts, including the first try. 0 removes only the attempt-count cap."},
+				{Name: "same_auth_retries", Type: pluginapi.ConfigFieldTypeInteger, Description: "Extra attempts on each credential before failover, selecting remaining available credentials by priority. 0 keeps normal CPA selection. Requires this plugin to be the active scheduler; host cooldowns still apply."},
 				{Name: "initial_delay_ms", Type: pluginapi.ConfigFieldTypeInteger, Description: "Positive initial delay before a retry."},
 				{Name: "max_delay_ms", Type: pluginapi.ConfigFieldTypeInteger, Description: "Positive maximum exponential backoff delay."},
 				{Name: "max_elapsed_time_ms", Type: pluginapi.ConfigFieldTypeInteger, Description: "Wall-clock limit for one retry sequence. 0 removes the time limit."},
@@ -208,13 +215,15 @@ func pluginRegistration() registration {
 			},
 		},
 		Capabilities: registrationCapability{
-			ModelRouter:            true,
-			Executor:               true,
-			RequestInterceptor:     lifecycleEventsSupported(schemaVersion),
-			RequestLifecyclePlugin: lifecycleEventsSupported(schemaVersion),
-			ExecutorModelScope:     string(pluginapi.ExecutorModelScopeStatic),
-			ExecutorInputFormats:   supportedExecutorFormats(),
-			ExecutorOutputFormats:  supportedExecutorFormats(),
+			Scheduler:                 credentialRetryEnabled(loadedConfig()),
+			SchedulerAcrossPriorities: credentialRetryEnabled(loadedConfig()),
+			ModelRouter:               true,
+			Executor:                  true,
+			RequestInterceptor:        lifecycleEventsSupported(schemaVersion),
+			RequestLifecyclePlugin:    lifecycleEventsSupported(schemaVersion),
+			ExecutorModelScope:        string(pluginapi.ExecutorModelScopeStatic),
+			ExecutorInputFormats:      supportedExecutorFormats(),
+			ExecutorOutputFormats:     supportedExecutorFormats(),
 		},
 	}
 }
@@ -418,6 +427,7 @@ func retryLogFields(req rpcExecutorRequest, cfg pluginConfig, attempt int, statu
 		"status":               status,
 		"retryable_status":     shouldRetryStatus(cfg, status),
 		"max_attempts":         cfg.MaxAttempts,
+		"same_auth_retries":    cfg.SameAuthRetries,
 		"max_elapsed_time_ms":  cfg.MaxElapsedMS,
 		"status_codes":         []int(cfg.StatusCodes),
 		"retry_keywords_count": len(cfg.RetryKeywords),
@@ -428,16 +438,28 @@ func runModelExecuteWithRetry(ctx context.Context, req rpcExecutorRequest) (plug
 	cfg := retryConfigForModel(loadedConfig(), req.Model)
 	ctx, cancel := retryContext(ctx, cfg)
 	defer cancel()
+	credentials, releaseCredentials := beginCredentialRetry(&req, cfg)
+	defer releaseCredentials()
 	pluginLog(req.HostCallbackID, "info", "model-retry-wrapper: retry executor start", retryLogFields(req, cfg, 0, 0, false))
 	var lastErr error
-	for attempt := 1; ; attempt++ {
+	for attempt := 1; ; {
 		if errContext := ctx.Err(); errContext != nil {
 			status := statusFromError(lastErr)
 			message := retryDecisionDiagnostic("model-retry-wrapper: retry stopped", cfg, attempt-1, status, lastErr, errContext)
 			pluginLog(req.HostCallbackID, "warn", message, retryLogFields(req, cfg, attempt-1, status, false))
 			return pluginapi.HostModelExecutionResponse{}, retryTerminationError(lastErr, errContext)
 		}
+		credentials.prepare(&req)
 		resp, status, errCall := callHostModelExecute(req)
+		if delay, cooling := credentials.cooldownDelay(req, errCall, cfg, attempt); cooling {
+			if errWait := waitCredentialCooldown(ctx, req, delay, attempt); errWait != nil {
+				return pluginapi.HostModelExecutionResponse{}, retryTerminationError(lastErr, errWait)
+			}
+			continue
+		}
+		if credentials.noAlternative() && errCall != nil {
+			return pluginapi.HostModelExecutionResponse{}, errCall
+		}
 		if errCall == nil && !shouldRetryStatus(cfg, status) {
 			pluginLog(req.HostCallbackID, "debug", "model-retry-wrapper: attempt completed without retry", retryLogFields(req, cfg, attempt, status, false))
 			return resp, nil
@@ -450,20 +472,27 @@ func runModelExecuteWithRetry(ctx context.Context, req rpcExecutorRequest) (plug
 		}
 		fields := retryLogFields(req, cfg, attempt, status, false)
 		shouldRetry, _ := shouldRetryFailure(cfg, attempt, status, errCall)
+		credentialFailover := !shouldRetry && credentials.releaseForFailover(cfg, attempt)
+		shouldRetry = shouldRetry || credentialFailover
 		if !shouldRetry {
 			message := retryDecisionDiagnostic("model-retry-wrapper: retry stopped", cfg, attempt, status, errCall, nil)
 			pluginLog(req.HostCallbackID, "warn", message, fields)
 			return pluginapi.HostModelExecutionResponse{}, lastErr
 		}
+		credentials.failed()
 		delay := retryDelay(cfg, attempt)
 		fields["delay_ms"] = durationMillis(delay)
 		message := retryDecisionDiagnostic("model-retry-wrapper: retrying request", cfg, attempt, status, errCall, nil)
+		if credentialFailover {
+			message = fmt.Sprintf("model-retry-wrapper: resuming CPA credential failover attempt=%d status=%d", attempt, status)
+		}
 		pluginLog(req.HostCallbackID, "warn", message, fields)
 		if errWait := waitRetryDelay(ctx, delay); errWait != nil {
 			message := retryDecisionDiagnostic("model-retry-wrapper: retry wait canceled", cfg, attempt, status, errCall, errWait)
 			pluginLog(req.HostCallbackID, "warn", message, fields)
 			return pluginapi.HostModelExecutionResponse{}, retryTerminationError(lastErr, errWait)
 		}
+		attempt++
 	}
 }
 
@@ -471,16 +500,28 @@ func runModelStreamWithRetry(ctx context.Context, req rpcExecutorRequest) error 
 	cfg := retryConfigForModel(loadedConfig(), req.Model)
 	ctx, cancel := retryContext(ctx, cfg)
 	defer cancel()
+	credentials, releaseCredentials := beginCredentialRetry(&req, cfg)
+	defer releaseCredentials()
 	pluginLog(req.HostCallbackID, "info", "model-retry-wrapper: stream retry executor start", retryLogFields(req, cfg, 0, 0, true))
 	var lastErr error
-	for attempt := 1; ; attempt++ {
+	for attempt := 1; ; {
 		if errContext := ctx.Err(); errContext != nil {
 			status := statusFromError(lastErr)
 			message := retryDecisionDiagnostic("model-retry-wrapper: stream retry stopped", cfg, attempt-1, status, lastErr, errContext)
 			pluginLog(req.HostCallbackID, "warn", message, retryLogFields(req, cfg, attempt-1, status, true))
 			return retryTerminationError(lastErr, errContext)
 		}
+		credentials.prepare(&req)
 		status, firstPayload, streamID, errStart := startHostModelStream(req)
+		if delay, cooling := credentials.cooldownDelay(req, errStart, cfg, attempt); cooling {
+			if errWait := waitCredentialCooldown(ctx, req, delay, attempt); errWait != nil {
+				return retryTerminationError(lastErr, errWait)
+			}
+			continue
+		}
+		if credentials.noAlternative() && errStart != nil {
+			return errStart
+		}
 		if errStart == nil {
 			errStart = retryableStreamStartupError(cfg, attempt, exitProtocol(req.ExecutorRequest), firstPayload)
 		}
@@ -492,6 +533,7 @@ func runModelStreamWithRetry(ctx context.Context, req rpcExecutorRequest) error 
 			message := fmt.Sprintf("model-retry-wrapper: stream startup completed without retry status=%d first_payload=%t entry_protocol=%s exit_protocol=%s %s",
 				status, len(firstPayload) > 0, diagnosticProtocol(entryProtocol(req.ExecutorRequest)), diagnosticProtocol(exitProtocol(req.ExecutorRequest)), diagnostics.summary())
 			pluginLog(req.HostCallbackID, "debug", message, fields)
+			releaseCredentials()
 			return forwardHostStream(ctx, streamID, firstPayload, req, cfg, diagnostics)
 		}
 		if streamID != "" {
@@ -505,20 +547,27 @@ func runModelStreamWithRetry(ctx context.Context, req rpcExecutorRequest) error 
 		}
 		fields := retryLogFields(req, cfg, attempt, status, true)
 		shouldRetry, _ := shouldRetryFailure(cfg, attempt, status, errStart)
+		credentialFailover := !shouldRetry && credentials.releaseForFailover(cfg, attempt)
+		shouldRetry = shouldRetry || credentialFailover
 		if !shouldRetry {
 			message := retryDecisionDiagnostic("model-retry-wrapper: stream retry stopped", cfg, attempt, status, errStart, nil)
 			pluginLog(req.HostCallbackID, "warn", message, fields)
 			return lastErr
 		}
+		credentials.failed()
 		delay := retryDelay(cfg, attempt)
 		fields["delay_ms"] = durationMillis(delay)
 		message := retryDecisionDiagnostic("model-retry-wrapper: retrying stream startup", cfg, attempt, status, errStart, nil)
+		if credentialFailover {
+			message = fmt.Sprintf("model-retry-wrapper: resuming CPA stream credential failover attempt=%d status=%d", attempt, status)
+		}
 		pluginLog(req.HostCallbackID, "warn", message, fields)
 		if errWait := waitRetryDelay(ctx, delay); errWait != nil {
 			message := retryDecisionDiagnostic("model-retry-wrapper: stream retry wait canceled", cfg, attempt, status, errStart, errWait)
 			pluginLog(req.HostCallbackID, "warn", message, fields)
 			return retryTerminationError(lastErr, errWait)
 		}
+		attempt++
 	}
 }
 
@@ -530,7 +579,8 @@ func callHostModelExecute(req rpcExecutorRequest) (pluginapi.HostModelExecutionR
 			Model:         req.Model,
 			Stream:        false,
 			Body:          requestBody(req.ExecutorRequest),
-			Headers:       nestedRequestHeaders(req.Headers),
+			Headers:       credentialRequestHeaders(req),
+			AuthID:        req.pinnedAuthID,
 			Query:         cloneValues(req.Query),
 			Alt:           req.Alt,
 		},
@@ -557,7 +607,8 @@ func startHostModelStream(req rpcExecutorRequest) (int, []byte, string, error) {
 			Model:         req.Model,
 			Stream:        true,
 			Body:          requestBody(req.ExecutorRequest),
-			Headers:       nestedRequestHeaders(req.Headers),
+			Headers:       credentialRequestHeaders(req),
+			AuthID:        req.pinnedAuthID,
 			Query:         cloneValues(req.Query),
 			Alt:           req.Alt,
 		},
@@ -687,7 +738,9 @@ func closePluginStream(streamID, errMsg string) {
 	_, _ = callHost(pluginabi.MethodHostStreamClose, rpcStreamCloseRequest{StreamID: streamID, Error: strings.TrimSpace(errMsg)})
 }
 
-func callHost(method string, payload any) (json.RawMessage, error) {
+var callHost = callHostAPI
+
+func callHostAPI(method string, payload any) (json.RawMessage, error) {
 	rawPayload, errMarshal := json.Marshal(payload)
 	if errMarshal != nil {
 		return nil, fmt.Errorf("marshal host callback payload %s: %w", method, errMarshal)
