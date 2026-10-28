@@ -6,10 +6,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/url"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -253,8 +255,8 @@ func TestEveryCredentialGetsItsOwnRetryBudget(t *testing.T) {
 		{"two retries per credential", 2, 7, 503, 200, []string{"A", "A", "A", "B", "B", "B", "C"}, false},
 		{"one retry per credential", 1, 5, 502, 200, []string{"A", "A", "B", "B", "C"}, false},
 		{"total cap during second credential", 2, 4, 503, 200, []string{"A", "A", "A", "B"}, true},
-		{"all credentials exhausted", 2, 12, 503, 503, []string{"A", "A", "A", "B", "B", "B", "C", "C", "C"}, true},
-		{"authentication failover resets next budget", 2, 12, 401, 503, []string{"A", "A", "A", "B", "C", "C", "C"}, true},
+		{"all credentials start another round", 2, 12, 503, 503, []string{"A", "A", "A", "B", "B", "B", "C", "C", "C", "A", "A", "A"}, true},
+		{"authentication failover excludes across rounds", 2, 12, 401, 503, []string{"A", "A", "A", "B", "C", "C", "C", "A", "A", "A", "C", "C"}, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			cfg := defaultPluginConfig()
@@ -311,7 +313,7 @@ func TestCredentialCooldownDoesNotConsumeRetries(t *testing.T) {
 	defer cleanup()
 	state.prepare(&req)
 	pickCredentialForTest(t, credentialRequestHeaders(req), pluginapi.SchedulerAuthCandidate{ID: "A"})
-	state.failed()
+	state.failed(true)
 	state.prepare(&req)
 	err := errors.New(`host_call_failed: {"error":{"code":"model_cooldown","reset_seconds":30,"last_upstream_error":"private"}}`)
 	for i := 0; i < 4; i++ {
@@ -348,11 +350,11 @@ func TestCredentialHeadersAndSingleCandidateExhaustion(t *testing.T) {
 	for i := 0; i < 2; i++ {
 		state.prepare(&req)
 		pickCredentialForTest(t, credentialRequestHeaders(req), pluginapi.SchedulerAuthCandidate{ID: "A", Priority: 10})
-		state.failed()
+		state.failed(true)
 	}
 	state.prepare(&req)
-	if got := pickCredentialForTest(t, credentialRequestHeaders(req), pluginapi.SchedulerAuthCandidate{ID: "A", Priority: 10}); !got.Reject || !state.noAlternative() {
-		t.Fatal("exhausted credential was selected again")
+	if got := pickCredentialForTest(t, credentialRequestHeaders(req), pluginapi.SchedulerAuthCandidate{ID: "A", Priority: 10}); got.AuthID != "A" || state.round != 2 || state.failures != 0 {
+		t.Fatal("exhausted credential did not receive a new round's budget")
 	}
 }
 
@@ -402,5 +404,443 @@ func TestCredentialRetryRecognizesStreamFailureBeforePayload(t *testing.T) {
 	req.SourceFormat, req.Format = "codex", "codex"
 	if err := runModelStreamWithRetry(context.Background(), req); err != nil || !reflect.DeepEqual(*calls, []string{"A", "A", "A", "B"}) {
 		t.Fatalf("calls=%v error=%v", *calls, err)
+	}
+}
+
+// Reuse the existing transport stub, with configurable candidates and failures.
+// Native failover asks for a second pick; the wrapper must defer that pick.
+func installCredentialRoundHost(t *testing.T, cfg pluginConfig, stream bool, candidates []pluginapi.SchedulerAuthCandidate, execute func(string, int) error) *[]string {
+	t.Helper()
+	calls, _ := installCredentialHost(t, cfg, stream, 200, false)
+	host := callHost
+	callHost = func(method string, payload any) (json.RawMessage, error) {
+		if method != pluginabi.MethodHostModelExecute && method != pluginabi.MethodHostModelExecuteStream {
+			return host(method, payload)
+		}
+		req := payload.(hostModelExecutionRequest)
+		available := make([]pluginapi.SchedulerAuthCandidate, 0, len(candidates))
+		for _, candidate := range candidates {
+			if req.AuthID == "" || req.AuthID == candidate.ID {
+				available = append(available, candidate)
+			}
+		}
+		pick := pickCredentialForTest(t, req.Headers, available...)
+		if !pick.Handled || pick.Reject {
+			return nil, errors.New("auth_unavailable: no available credential")
+		}
+		*calls = append(*calls, pick.AuthID)
+		if err := execute(pick.AuthID, len(*calls)); err != nil {
+			var remaining []pluginapi.SchedulerAuthCandidate
+			for _, candidate := range available {
+				if candidate.ID != pick.AuthID {
+					remaining = append(remaining, candidate)
+				}
+			}
+			if len(remaining) > 0 && !pickCredentialForTest(t, req.Headers, remaining...).Reject {
+				t.Fatal("native failover bypassed the wrapper attempt budget")
+			}
+			return nil, err
+		}
+		if stream {
+			return json.Marshal(pluginapi.HostModelStreamResponse{StatusCode: 200, StreamID: "stream"})
+		}
+		return json.Marshal(pluginapi.HostModelExecutionResponse{StatusCode: 200, Body: []byte("success")})
+	}
+	return calls
+}
+
+func runCredentialRoundTest(ctx context.Context, stream bool) error {
+	if stream {
+		return runModelStreamWithRetry(ctx, credentialTestRequest())
+	}
+	_, err := runModelExecuteWithRetry(ctx, credentialTestRequest())
+	return err
+}
+
+func TestCredentialRetryRounds(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		for _, tc := range []struct {
+			name         string
+			two          bool
+			max, success int
+			want         string
+		}{
+			{"single second round", false, 0, 4, "AAAA"},
+			{"single third round", false, 0, 7, "AAAAAAA"},
+			{"two second round", true, 0, 8, "AAABBBAA"},
+			{"eight attempt cap", true, 8, 0, "AAABBBAA"},
+			{"success at cap", true, 8, 8, "AAABBBAA"},
+			{"cap before round ends", false, 2, 0, "AA"},
+		} {
+			t.Run(fmt.Sprintf("%s/stream=%t", tc.name, stream), func(t *testing.T) {
+				cfg := defaultPluginConfig()
+				cfg.Models, cfg.SameAuthRetries, cfg.MaxAttempts = []string{"test"}, 2, tc.max
+				cfg.InitialDelayMS, cfg.MaxDelayMS = 1, 1
+				candidates := []pluginapi.SchedulerAuthCandidate{{ID: "A", Priority: 10}}
+				if tc.two {
+					candidates = append(candidates, pluginapi.SchedulerAuthCandidate{ID: "B", Priority: 1})
+				}
+				calls := installCredentialRoundHost(t, cfg, stream, candidates, func(_ string, attempt int) error {
+					if attempt == tc.success {
+						return nil
+					}
+					return retryStatusError{status: 503, err: errors.New("upstream failed")}
+				})
+				ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+				defer cancel()
+				err := runCredentialRoundTest(ctx, stream)
+				if strings.Join(*calls, "") != tc.want || (err != nil) != (tc.success == 0) {
+					t.Fatalf("calls=%v error=%v", *calls, err)
+				}
+				if err != nil && (statusFromError(err) != 503 || !strings.Contains(err.Error(), "max_attempts") || !strings.Contains(err.Error(), "upstream failed")) {
+					t.Fatalf("attempt cap lost status, cause or upstream error: %v", err)
+				}
+			})
+		}
+	}
+}
+
+func TestCredentialRoundsCooldownWithoutSchedulerCallback(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		for _, runtime := range []bool{false, true} {
+			t.Run(fmt.Sprintf("stream=%t/runtime=%t", stream, runtime), func(t *testing.T) {
+				cfg := defaultPluginConfig()
+				cfg.Models, cfg.SameAuthRetries, cfg.MaxAttempts = []string{"test"}, 1, 3
+				cfg.InitialDelayMS, cfg.MaxDelayMS = 1, 1
+				calls := installCredentialRoundHost(t, cfg, stream, []pluginapi.SchedulerAuthCandidate{{ID: "A"}}, func(_ string, attempt int) error {
+					if attempt == 3 {
+						return nil
+					}
+					return retryStatusError{status: 503}
+				})
+				host := callHost
+				checks := 0
+				callHost = func(method string, payload any) (json.RawMessage, error) {
+					if method == pluginabi.MethodHostAuthList {
+						return json.Marshal(map[string]any{"files": []pluginapi.HostAuthFileEntry{{ID: "A", NextRetryAfter: time.Now().Add(time.Minute)}}})
+					}
+					if (method == pluginabi.MethodHostModelExecute || method == pluginabi.MethodHostModelExecuteStream) && len(*calls) == 2 && checks < 3 {
+						if payload.(hostModelExecutionRequest).AuthID != "" {
+							t.Fatal("round transition retained its pin")
+						}
+						checks++
+						if runtime {
+							return nil, errors.New("auth_unavailable: no available credential")
+						}
+						return nil, errors.New(`{"error":{"code":"model_cooldown","reset_seconds":1}}`)
+					}
+					return host(method, payload)
+				}
+				ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+				defer cancel()
+				started := time.Now()
+				err := runCredentialRoundTest(ctx, stream)
+				if err != nil || checks != 3 || strings.Join(*calls, "") != "AAA" || time.Since(started) < 5*time.Millisecond {
+					t.Fatalf("calls=%v cooldown checks=%d error=%v", *calls, checks, err)
+				}
+			})
+		}
+	}
+}
+
+func TestCredentialRoundTerminationPreservesUpstream(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		for _, reason := range []string{"canceled", "deadline", "no candidates", "disabled", "unrelated cooldown"} {
+			t.Run(fmt.Sprintf("%s/stream=%t", reason, stream), func(t *testing.T) {
+				cfg := defaultPluginConfig()
+				cfg.Models, cfg.SameAuthRetries = []string{"test"}, 1
+				cfg.InitialDelayMS, cfg.MaxDelayMS = 1, 1
+				if reason == "deadline" {
+					cfg.MaxElapsedMS = 40
+				}
+				ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+				defer cancel()
+				upstreamErr := retryStatusError{status: 502, err: errors.New("last upstream failure")}
+				calls := installCredentialRoundHost(t, cfg, stream, []pluginapi.SchedulerAuthCandidate{{ID: "A"}}, func(_ string, attempt int) error {
+					if reason == "canceled" && attempt == 4 {
+						cancel()
+					}
+					return upstreamErr
+				})
+				host := callHost
+				callHost = func(method string, payload any) (json.RawMessage, error) {
+					if reason != "canceled" && len(*calls) >= 3 {
+						if method == pluginabi.MethodHostAuthList {
+							entry := pluginapi.HostAuthFileEntry{ID: "A", Disabled: reason == "disabled", NextRetryAfter: time.Now().Add(time.Minute)}
+							if reason == "unrelated cooldown" {
+								entry.ID = "other-model"
+							}
+							if reason == "no candidates" {
+								return json.RawMessage(`{"files":[]}`), nil
+							}
+							return json.Marshal(map[string]any{"files": []pluginapi.HostAuthFileEntry{entry}})
+						}
+						if method == pluginabi.MethodHostModelExecute || method == pluginabi.MethodHostModelExecuteStream {
+							return nil, errors.New("auth_unavailable: no available credential")
+						}
+					}
+					return host(method, payload)
+				}
+				err := runCredentialRoundTest(ctx, stream)
+				if err == nil || statusFromError(err) != 502 || !strings.Contains(err.Error(), upstreamErr.Error()) {
+					t.Fatalf("calls=%v error=%v", *calls, err)
+				}
+				switch reason {
+				case "canceled":
+					if !errors.Is(err, context.Canceled) || len(*calls) != 4 {
+						t.Fatalf("calls=%v error=%v", *calls, err)
+					}
+				case "deadline":
+					if !errors.Is(err, context.DeadlineExceeded) || len(*calls) != 3 {
+						t.Fatalf("calls=%v error=%v", *calls, err)
+					}
+				default:
+					if !strings.Contains(err.Error(), "auth_unavailable") || errors.Is(err, context.DeadlineExceeded) || len(*calls) != 3 {
+						t.Fatalf("calls=%v error=%v", *calls, err)
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestCredentialRoundsStopWhenAllExcluded(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		cfg := defaultPluginConfig()
+		cfg.Models, cfg.SameAuthRetries = []string{"test"}, 2
+		cfg.InitialDelayMS, cfg.MaxDelayMS = 1, 1
+		calls := installCredentialRoundHost(t, cfg, stream, []pluginapi.SchedulerAuthCandidate{{ID: "A", Priority: 10}, {ID: "B"}}, func(id string, _ int) error {
+			return retryStatusError{status: 401, err: fmt.Errorf("upstream rejected %s", id)}
+		})
+		host := callHost
+		callHost = func(method string, payload any) (json.RawMessage, error) {
+			if len(*calls) == 2 && (method == pluginabi.MethodHostModelExecute || method == pluginabi.MethodHostModelExecuteStream) {
+				return nil, errors.New(`{"error":{"code":"model_cooldown","reset_seconds":60}}`)
+			}
+			return host(method, payload)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		err := runCredentialRoundTest(ctx, stream)
+		cancel()
+		if err == nil || errors.Is(err, context.DeadlineExceeded) || statusFromError(err) != 401 || strings.Join(*calls, "") != "AB" || !strings.Contains(err.Error(), "upstream rejected B") {
+			t.Fatalf("stream=%t calls=%v error=%v", stream, *calls, err)
+		}
+	}
+}
+
+func TestConcurrentCredentialRoundsAndFreshRequest(t *testing.T) {
+	cfg := defaultPluginConfig()
+	cfg.SameAuthRetries = 1
+	candidates := []pluginapi.SchedulerAuthCandidate{{ID: "B", Priority: 1}, {ID: "A", Priority: 1}}
+	var requests sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		requests.Go(func() {
+			req := rpcExecutorRequest{}
+			state, cleanup := beginCredentialRetry(&req, cfg)
+			defer cleanup()
+			var order string
+			for j := 0; j < 8; j++ {
+				state.prepare(&req)
+				order += pickCredentialForTest(t, credentialRequestHeaders(req), candidates...).AuthID
+				state.failed(true)
+			}
+			if order != "AABBAABB" {
+				t.Errorf("concurrent request inherited credential state: %s", order)
+			}
+		})
+	}
+	requests.Wait()
+	req := rpcExecutorRequest{}
+	state, cleanup := beginCredentialRetry(&req, cfg)
+	defer cleanup()
+	state.prepare(&req)
+	if got := pickCredentialForTest(t, credentialRequestHeaders(req), candidates...); got.AuthID != "A" {
+		t.Fatalf("fresh request did not start with highest priority and ID: %q", got.AuthID)
+	}
+}
+
+func TestCredentialEmptySelectionsDoNotConsumeAttemptCap(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		for _, pinnedUnavailable := range []bool{false, true} {
+			t.Run(fmt.Sprintf("stream=%t/pinned_unavailable=%t", stream, pinnedUnavailable), func(t *testing.T) {
+				cfg := defaultPluginConfig()
+				cfg.Models, cfg.SameAuthRetries, cfg.MaxAttempts = []string{"test"}, 2, 1
+				cfg.InitialDelayMS, cfg.MaxDelayMS = 1, 1
+				if pinnedUnavailable {
+					cfg.MaxAttempts = 2
+				}
+				calls := installCredentialRoundHost(t, cfg, stream, []pluginapi.SchedulerAuthCandidate{{ID: "A", Priority: 10}, {ID: "B"}}, func(id string, _ int) error {
+					if pinnedUnavailable && id == "A" {
+						return retryStatusError{status: 503}
+					}
+					return nil
+				})
+				host := callHost
+				checks := 0
+				callHost = func(method string, payload any) (json.RawMessage, error) {
+					if method == pluginabi.MethodHostModelExecute || method == pluginabi.MethodHostModelExecuteStream {
+						if !pinnedUnavailable && checks < 2 {
+							checks++
+							return nil, errors.New(`{"error":{"code":"model_cooldown","reset_seconds":1}}`)
+						}
+						if pinnedUnavailable && payload.(hostModelExecutionRequest).AuthID == "A" {
+							checks++
+							return nil, errors.New("auth_unavailable: pinned credential removed")
+						}
+					}
+					return host(method, payload)
+				}
+				ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+				defer cancel()
+				err := runCredentialRoundTest(ctx, stream)
+				want, wantChecks := "A", 2
+				if pinnedUnavailable {
+					want, wantChecks = "AB", 1
+				}
+				if err != nil || strings.Join(*calls, "") != want || checks != wantChecks {
+					t.Fatalf("calls=%v empty checks=%d error=%v", *calls, checks, err)
+				}
+			})
+		}
+	}
+}
+
+func TestCredentialRoundBackoffContinues(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		cfg := defaultPluginConfig()
+		cfg.Models, cfg.SameAuthRetries, cfg.MaxAttempts = []string{"test"}, 1, 5
+		cfg.InitialDelayMS, cfg.MaxDelayMS = 1, 8
+		installCredentialRoundHost(t, cfg, stream, []pluginapi.SchedulerAuthCandidate{{ID: "A"}}, func(_ string, attempt int) error {
+			if attempt == 5 {
+				return nil
+			}
+			return retryStatusError{status: 503}
+		})
+		host := callHost
+		var delays []int64
+		callHost = func(method string, payload any) (json.RawMessage, error) {
+			if method == pluginabi.MethodHostLog {
+				if delay, ok := payload.(rpcHostLogRequest).Fields["delay_ms"].(int64); ok {
+					delays = append(delays, delay)
+				}
+			}
+			return host(method, payload)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		err := runCredentialRoundTest(ctx, stream)
+		cancel()
+		if err != nil || !reflect.DeepEqual(delays, []int64{1, 2, 4, 8}) {
+			t.Fatalf("stream=%t delays=%v error=%v", stream, delays, err)
+		}
+	}
+}
+
+func TestCredentialRoundsWithStreamStartupEvents(t *testing.T) {
+	for _, afterPayloadError := range []bool{false, true} {
+		cfg := defaultPluginConfig()
+		cfg.Models, cfg.SameAuthRetries, cfg.MaxAttempts = []string{"test"}, 2, 8
+		cfg.InitialDelayMS, cfg.MaxDelayMS = 1, 1
+		calls := installCredentialRoundHost(t, cfg, true, []pluginapi.SchedulerAuthCandidate{{ID: "A", Priority: 10}, {ID: "B"}}, func(string, int) error { return nil })
+		host := callHost
+		forwardedReads := 0
+		callHost = func(method string, payload any) (json.RawMessage, error) {
+			if method == pluginabi.MethodHostModelStreamRead {
+				if len(*calls) <= 6 {
+					return json.Marshal(pluginapi.HostModelStreamReadResponse{Payload: []byte("data: " + startupFailedJSON + "\n\n")})
+				}
+				forwardedReads++
+				if forwardedReads > 1 && afterPayloadError {
+					return json.Marshal(pluginapi.HostModelStreamReadResponse{Error: "HTTP 503 after payload"})
+				}
+			}
+			return host(method, payload)
+		}
+		req := credentialTestRequest()
+		req.SourceFormat, req.Format = "codex", "codex"
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		err := runModelStreamWithRetry(ctx, req)
+		cancel()
+		if (err != nil) != afterPayloadError || strings.Join(*calls, "") != "AAABBBA" {
+			t.Fatalf("calls=%v error=%v", *calls, err)
+		}
+	}
+}
+
+func TestCredentialRoundsUseModelOverride(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		cfg, err := decodeConfig([]byte("models: [test]\nsame_auth_retries: 2\nmax_attempts: 5\ninitial_delay_ms: 1\nmax_delay_ms: 1\nmodel_overrides: {test: {same_auth_retries: 1}}\n"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		calls := installCredentialRoundHost(t, cfg, stream, []pluginapi.SchedulerAuthCandidate{{ID: "A", Priority: 10}, {ID: "B"}}, func(_ string, attempt int) error {
+			if attempt == 5 {
+				return nil
+			}
+			return retryStatusError{status: 503}
+		})
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		err = runCredentialRoundTest(ctx, stream)
+		cancel()
+		if err != nil || strings.Join(*calls, "") != "AABBA" {
+			t.Fatalf("stream=%t calls=%v error=%v", stream, *calls, err)
+		}
+	}
+}
+
+func TestCredentialRoundCanRestartWhileUnusedCredentialCools(t *testing.T) {
+	cfg := defaultPluginConfig()
+	cfg.SameAuthRetries = 1
+	req := rpcExecutorRequest{}
+	state, cleanup := beginCredentialRetry(&req, cfg)
+	defer cleanup()
+	available := []pluginapi.SchedulerAuthCandidate{{ID: "A", Priority: 10}, {ID: "B"}}
+	for i := 0; i < 2; i++ {
+		state.prepare(&req)
+		if got := pickCredentialForTest(t, credentialRequestHeaders(req), available...); got.AuthID != "A" {
+			t.Fatalf("first round selected %q", got.AuthID)
+		}
+		state.failed(true)
+	}
+	// B was observed earlier but is now cooling, so CPA offers only A.
+	state.prepare(&req)
+	if got := pickCredentialForTest(t, credentialRequestHeaders(req), available[0]); got.AuthID != "A" || state.round != 2 {
+		t.Fatal("a cooling unused credential blocked the next round")
+	}
+	if got := pickCredentialForTest(t, credentialRequestHeaders(req), available[1]); !got.Reject {
+		t.Fatal("native retry dispatched twice inside the new round's host call")
+	}
+}
+
+func TestZeroCredentialRetriesRetainNativeSelection(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		cfg, err := decodeConfig([]byte("models: [test]\nsame_auth_retries: 2\nmax_attempts: 2\ninitial_delay_ms: 1\nmax_delay_ms: 1\nmodel_overrides: {test: {same_auth_retries: 0}}\n"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		installCredentialHost(t, cfg, stream, 200, false)
+		host, attempts := callHost, 0
+		callHost = func(method string, payload any) (json.RawMessage, error) {
+			if method == pluginabi.MethodHostModelExecute || method == pluginabi.MethodHostModelExecuteStream {
+				req := payload.(hostModelExecutionRequest)
+				if req.AuthID != "" || req.Headers.Get(credentialSequenceHeader) != "" {
+					t.Fatal("zero override enabled credential scheduling")
+				}
+				attempts++
+				if attempts == 1 {
+					return nil, retryStatusError{status: 503}
+				}
+				if stream {
+					return json.Marshal(pluginapi.HostModelStreamResponse{StatusCode: 200, StreamID: "stream"})
+				}
+				return json.Marshal(pluginapi.HostModelExecutionResponse{StatusCode: 200})
+			}
+			return host(method, payload)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		err = runCredentialRoundTest(ctx, stream)
+		cancel()
+		if err != nil || attempts != 2 {
+			t.Fatalf("stream=%t attempts=%d error=%v", stream, attempts, err)
+		}
 	}
 }

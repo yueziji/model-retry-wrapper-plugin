@@ -23,14 +23,17 @@ const credentialSequenceHeader = "X-Model-Retry-Wrapper-Credential-Sequence"
 var credentialSequences sync.Map
 
 type credentialRetry struct {
-	mu          sync.Mutex
-	authID      string
-	retries     int
-	failures    int
-	dispatched  bool
-	exhausted   map[string]struct{}
-	unavailable bool
-	deferred    bool
+	mu         sync.Mutex
+	authID     string
+	retries    int
+	failures   int
+	dispatched bool
+	exhausted  map[string]struct{}
+	excluded   map[string]struct{}
+	candidates map[string]struct{}
+	round      int
+	newRound   bool
+	deferred   bool
 }
 
 func credentialRetryEnabled(cfg pluginConfig) bool {
@@ -50,7 +53,7 @@ func beginCredentialRetry(req *rpcExecutorRequest, cfg pluginConfig) (*credentia
 		return nil, func() {}
 	}
 	req.credentialSequence = rand.Text()
-	state := &credentialRetry{retries: cfg.SameAuthRetries}
+	state := &credentialRetry{retries: cfg.SameAuthRetries, round: 1}
 	credentialSequences.Store(req.credentialSequence, state)
 	return state, func() { credentialSequences.Delete(req.credentialSequence) }
 }
@@ -75,12 +78,12 @@ func (s *credentialRetry) prepare(req *rpcExecutorRequest) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.dispatched = false
-	s.unavailable = false
+	s.newRound = false
 	s.deferred = false
 	req.pinnedAuthID = s.authID
 }
 
-func (s *credentialRetry) failed() {
+func (s *credentialRetry) failed(retryable bool) {
 	if s == nil {
 		return
 	}
@@ -89,38 +92,67 @@ func (s *credentialRetry) failed() {
 	if s.authID == "" {
 		return
 	}
-	// An unselectable credential has not used an extra attempt. Unless the host
-	// supplied a cooldown deadline, move on rather than retrying a disabled auth.
-	if !s.dispatched {
-		s.retireLocked()
+	if !s.dispatched || !retryable {
+		s.retireLocked(false)
 		return
 	}
 	s.failures++
 	if s.failures > s.retries {
-		s.retireLocked()
+		s.retireLocked(true)
 	}
 }
 
-// Each credential receives a fresh retry budget. Completed credentials stay
-// excluded for the rest of this request, even after their cooldown expires.
-func (s *credentialRetry) retireLocked() {
+// Only matching failures exhaust a round's budget. Other retirements remain
+// excluded throughout this request, including after a round change.
+func (s *credentialRetry) retireLocked(exhausted bool) {
 	if s.authID != "" {
-		if s.exhausted == nil {
-			s.exhausted = make(map[string]struct{})
+		if exhausted {
+			if s.exhausted == nil {
+				s.exhausted = make(map[string]struct{})
+			}
+			s.exhausted[s.authID] = struct{}{}
+		} else {
+			if s.excluded == nil {
+				s.excluded = make(map[string]struct{})
+			}
+			s.excluded[s.authID] = struct{}{}
 		}
-		s.exhausted[s.authID] = struct{}{}
 	}
 	s.authID = ""
 	s.failures = 0
 }
 
-func (s *credentialRetry) noAlternative() bool {
+// Empty selections and cooldown checks never count as dispatched attempts.
+func (s *credentialRetry) selectionFailure(ctx context.Context, req rpcExecutorRequest, err error, cfg pluginConfig, attempt int) (bool, error) {
 	if s == nil {
-		return false
+		return false, nil
 	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.unavailable
+	dispatched, newRound, round := s.dispatched, s.newRound, s.round
+	s.mu.Unlock()
+	if newRound {
+		pluginLog(req.HostCallbackID, "debug", fmt.Sprintf("model-retry-wrapper: starting credential retry round round=%d attempt=%d", round, attempt), map[string]any{
+			"round": round, "attempt": attempt, "credential_retry": true,
+		})
+	}
+	if dispatched || err == nil {
+		return false, nil
+	}
+	if delay, cooling := s.cooldownDelay(req, err, cfg, attempt); cooling {
+		return true, waitCredentialCooldown(ctx, req, delay, attempt)
+	}
+	s.mu.Lock()
+	pinned := s.authID != ""
+	if pinned {
+		s.retireLocked(false)
+	}
+	s.mu.Unlock()
+	if pinned {
+		pluginLog(req.HostCallbackID, "debug", "model-retry-wrapper: releasing unavailable credential without cooldown", map[string]any{"attempt": attempt, "credential_retry": true})
+		return true, nil
+	}
+	pluginLog(req.HostCallbackID, "warn", "model-retry-wrapper: credential selection stopped stop_reason=no_available_credentials", map[string]any{"attempt": attempt - 1, "credential_retry": true})
+	return true, err
 }
 
 // Keep CPA's native failover for errors outside the wrapper's retry rules.
@@ -134,7 +166,7 @@ func (s *credentialRetry) releaseForFailover(cfg pluginConfig, attempt int) bool
 	if !s.deferred || s.authID == "" {
 		return false
 	}
-	s.retireLocked()
+	s.retireLocked(false)
 	return true
 }
 
@@ -167,20 +199,26 @@ func pickRetryCredential(raw []byte) ([]byte, error) {
 		s.deferred = true
 		return okEnvelope(reject)
 	}
-	var selected *pluginapi.SchedulerAuthCandidate
-	for i := range req.Candidates {
-		candidate := &req.Candidates[i]
-		_, exhausted := s.exhausted[candidate.ID]
-		if candidate.ID == "" || exhausted || (s.authID != "" && candidate.ID != s.authID) {
-			continue
+	if s.candidates == nil {
+		s.candidates = make(map[string]struct{})
+	}
+	for _, candidate := range req.Candidates {
+		if candidate.ID != "" {
+			s.candidates[candidate.ID] = struct{}{}
 		}
-		if selected == nil || candidate.Priority > selected.Priority ||
-			(candidate.Priority == selected.Priority && candidate.ID < selected.ID) {
-			selected = candidate
+	}
+	selected := s.selectLocked(req.Candidates, false)
+	if selected == nil && s.authID == "" && len(s.exhausted) > 0 {
+		// Re-evaluate only candidates CPA currently offers. A cooling unused
+		// credential must not hold up an available credential's next round.
+		selected = s.selectLocked(req.Candidates, true)
+		if selected != nil {
+			s.exhausted = nil
+			s.round++
+			s.newRound = true
 		}
 	}
 	if selected == nil {
-		s.unavailable = s.authID == ""
 		return okEnvelope(reject)
 	}
 	if s.authID == "" {
@@ -190,6 +228,23 @@ func pickRetryCredential(raw []byte) ([]byte, error) {
 	return okEnvelope(pluginapi.SchedulerPickResponse{Handled: true, AuthID: selected.ID})
 }
 
+func (s *credentialRetry) selectLocked(candidates []pluginapi.SchedulerAuthCandidate, nextRound bool) *pluginapi.SchedulerAuthCandidate {
+	var selected *pluginapi.SchedulerAuthCandidate
+	for i := range candidates {
+		candidate := &candidates[i]
+		_, exhausted := s.exhausted[candidate.ID]
+		_, excluded := s.excluded[candidate.ID]
+		if candidate.ID == "" || excluded || (exhausted && !nextRound) || (s.authID != "" && candidate.ID != s.authID) {
+			continue
+		}
+		if selected == nil || candidate.Priority > selected.Priority ||
+			(candidate.Priority == selected.Priority && candidate.ID < selected.ID) {
+			selected = candidate
+		}
+	}
+	return selected
+}
+
 // The RPC error preserves model_cooldown as JSON text, but not its Go type or
 // RetryAfter method. Read only the host's recovery fields; never log that text.
 func (s *credentialRetry) cooldownDelay(req rpcExecutorRequest, err error, cfg pluginConfig, attempt int) (time.Duration, bool) {
@@ -197,12 +252,22 @@ func (s *credentialRetry) cooldownDelay(req rpcExecutorRequest, err error, cfg p
 		return 0, false
 	}
 	s.mu.Lock()
-	if s.authID == "" || s.dispatched {
+	if s.dispatched {
 		s.mu.Unlock()
 		return 0, false
 	}
 	authID := s.authID
+	eligible := make(map[string]struct{})
+	for id := range s.candidates {
+		if _, excluded := s.excluded[id]; !excluded {
+			eligible[id] = struct{}{}
+		}
+	}
+	allExcluded := len(s.candidates) > 0 && len(eligible) == 0
 	s.mu.Unlock()
+	if allExcluded {
+		return 0, false
+	}
 	message := err.Error()
 	start := strings.IndexByte(message, '{')
 	var detail struct {
@@ -233,12 +298,15 @@ func (s *credentialRetry) cooldownDelay(req rpcExecutorRequest, err error, cfg p
 			return 0, false
 		}
 		for _, auth := range list.Files {
-			if auth.ID == authID && !auth.Disabled {
+			_, related := eligible[auth.ID]
+			if !auth.Disabled && ((authID != "" && auth.ID == authID) || (authID == "" && related)) {
 				if remaining := time.Until(auth.NextRetryAfter); remaining > 0 {
-					seconds = int64(remaining/time.Second) + 1
+					until := int64(remaining/time.Second) + 1
+					if !knownCooldown || until < seconds {
+						seconds = until
+					}
 					knownCooldown = true
 				}
-				break
 			}
 		}
 		if !knownCooldown {
@@ -261,7 +329,7 @@ func (s *credentialRetry) cooldownDelay(req rpcExecutorRequest, err error, cfg p
 }
 
 func waitCredentialCooldown(ctx context.Context, req rpcExecutorRequest, delay time.Duration, attempt int) error {
-	pluginLog(req.HostCallbackID, "debug", fmt.Sprintf("model-retry-wrapper: waiting for pinned credential cooldown attempt=%d delay_ms=%d", attempt, durationMillis(delay)), map[string]any{
+	pluginLog(req.HostCallbackID, "debug", fmt.Sprintf("model-retry-wrapper: waiting for credential cooldown attempt=%d delay_ms=%d stop_reason=model_cooldown", attempt, durationMillis(delay)), map[string]any{
 		"attempt": attempt, "delay_ms": durationMillis(delay), "credential_retry": true,
 	})
 	return waitRetryDelay(ctx, delay)

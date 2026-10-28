@@ -207,7 +207,7 @@ func pluginRegistration() registration {
 				{Name: "status_codes", Type: pluginapi.ConfigFieldTypeArray, Description: "HTTP status codes retried inside the plugin before downstream delivery."},
 				{Name: "retry_keywords", Type: pluginapi.ConfigFieldTypeArray, Description: "Error substrings that allow retries even when the HTTP status does not match status_codes; an explicit empty list disables keyword retries."},
 				{Name: "max_attempts", Type: pluginapi.ConfigFieldTypeInteger, Description: "Maximum attempts, including the first try. 0 removes only the attempt-count cap."},
-				{Name: "same_auth_retries", Type: pluginapi.ConfigFieldTypeInteger, Description: "Extra attempts on each credential before failover, selecting remaining available credentials by priority. 0 keeps normal CPA selection. Requires this plugin to be the active scheduler; host cooldowns still apply."},
+				{Name: "same_auth_retries", Type: pluginapi.ConfigFieldTypeInteger, Description: "Extra attempts per credential per round, selecting available credentials by priority and starting a new round when exhausted. Total attempt/time limits apply across rounds. 0 keeps normal CPA selection. Requires this plugin to be the active scheduler; host cooldowns still apply."},
 				{Name: "initial_delay_ms", Type: pluginapi.ConfigFieldTypeInteger, Description: "Positive initial delay before a retry."},
 				{Name: "max_delay_ms", Type: pluginapi.ConfigFieldTypeInteger, Description: "Positive maximum exponential backoff delay."},
 				{Name: "max_elapsed_time_ms", Type: pluginapi.ConfigFieldTypeInteger, Description: "Wall-clock limit for one retry sequence. 0 removes the time limit."},
@@ -451,14 +451,11 @@ func runModelExecuteWithRetry(ctx context.Context, req rpcExecutorRequest) (plug
 		}
 		credentials.prepare(&req)
 		resp, status, errCall := callHostModelExecute(req)
-		if delay, cooling := credentials.cooldownDelay(req, errCall, cfg, attempt); cooling {
-			if errWait := waitCredentialCooldown(ctx, req, delay, attempt); errWait != nil {
-				return pluginapi.HostModelExecutionResponse{}, retryTerminationError(lastErr, errWait)
+		if selection, errSelection := credentials.selectionFailure(ctx, req, errCall, cfg, attempt); selection {
+			if errSelection != nil {
+				return pluginapi.HostModelExecutionResponse{}, retryTerminationError(lastErr, errSelection)
 			}
 			continue
-		}
-		if credentials.noAlternative() && errCall != nil {
-			return pluginapi.HostModelExecutionResponse{}, errCall
 		}
 		if errCall == nil && !shouldRetryStatus(cfg, status) {
 			pluginLog(req.HostCallbackID, "debug", "model-retry-wrapper: attempt completed without retry", retryLogFields(req, cfg, attempt, status, false))
@@ -471,15 +468,19 @@ func runModelExecuteWithRetry(ctx context.Context, req rpcExecutorRequest) (plug
 			lastErr = retryStatusError{status: status}
 		}
 		fields := retryLogFields(req, cfg, attempt, status, false)
+		retryableFailure := shouldRetryStatus(cfg, status) || retryKeywordFromError(cfg, errCall) != ""
 		shouldRetry, _ := shouldRetryFailure(cfg, attempt, status, errCall)
-		credentialFailover := !shouldRetry && credentials.releaseForFailover(cfg, attempt)
+		credentialFailover := !retryableFailure && credentials.releaseForFailover(cfg, attempt)
 		shouldRetry = shouldRetry || credentialFailover
 		if !shouldRetry {
 			message := retryDecisionDiagnostic("model-retry-wrapper: retry stopped", cfg, attempt, status, errCall, nil)
 			pluginLog(req.HostCallbackID, "warn", message, fields)
+			if credentials != nil && cfg.MaxAttempts > 0 && attempt >= cfg.MaxAttempts {
+				lastErr = retryTerminationError(lastErr, fmt.Errorf("max_attempts reached (%d)", cfg.MaxAttempts))
+			}
 			return pluginapi.HostModelExecutionResponse{}, lastErr
 		}
-		credentials.failed()
+		credentials.failed(retryableFailure)
 		delay := retryDelay(cfg, attempt)
 		fields["delay_ms"] = durationMillis(delay)
 		message := retryDecisionDiagnostic("model-retry-wrapper: retrying request", cfg, attempt, status, errCall, nil)
@@ -513,14 +514,11 @@ func runModelStreamWithRetry(ctx context.Context, req rpcExecutorRequest) error 
 		}
 		credentials.prepare(&req)
 		status, firstPayload, streamID, errStart := startHostModelStream(req)
-		if delay, cooling := credentials.cooldownDelay(req, errStart, cfg, attempt); cooling {
-			if errWait := waitCredentialCooldown(ctx, req, delay, attempt); errWait != nil {
-				return retryTerminationError(lastErr, errWait)
+		if selection, errSelection := credentials.selectionFailure(ctx, req, errStart, cfg, attempt); selection {
+			if errSelection != nil {
+				return retryTerminationError(lastErr, errSelection)
 			}
 			continue
-		}
-		if credentials.noAlternative() && errStart != nil {
-			return errStart
 		}
 		if errStart == nil {
 			errStart = retryableStreamStartupError(cfg, attempt, exitProtocol(req.ExecutorRequest), firstPayload)
@@ -546,15 +544,19 @@ func runModelStreamWithRetry(ctx context.Context, req rpcExecutorRequest) error 
 			lastErr = retryStatusError{status: status}
 		}
 		fields := retryLogFields(req, cfg, attempt, status, true)
+		retryableFailure := shouldRetryStatus(cfg, status) || retryKeywordFromError(cfg, errStart) != ""
 		shouldRetry, _ := shouldRetryFailure(cfg, attempt, status, errStart)
-		credentialFailover := !shouldRetry && credentials.releaseForFailover(cfg, attempt)
+		credentialFailover := !retryableFailure && credentials.releaseForFailover(cfg, attempt)
 		shouldRetry = shouldRetry || credentialFailover
 		if !shouldRetry {
 			message := retryDecisionDiagnostic("model-retry-wrapper: stream retry stopped", cfg, attempt, status, errStart, nil)
 			pluginLog(req.HostCallbackID, "warn", message, fields)
+			if credentials != nil && cfg.MaxAttempts > 0 && attempt >= cfg.MaxAttempts {
+				lastErr = retryTerminationError(lastErr, fmt.Errorf("max_attempts reached (%d)", cfg.MaxAttempts))
+			}
 			return lastErr
 		}
-		credentials.failed()
+		credentials.failed(retryableFailure)
 		delay := retryDelay(cfg, attempt)
 		fields["delay_ms"] = durationMillis(delay)
 		message := retryDecisionDiagnostic("model-retry-wrapper: retrying stream startup", cfg, attempt, status, errStart, nil)
