@@ -15,8 +15,8 @@ import (
 	"strings"
 	"unsafe"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginabi"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 )
 
 const pluginIdentifier = "model-retry-wrapper"
@@ -34,15 +34,17 @@ type registration struct {
 }
 
 type registrationCapability struct {
-	Scheduler                 bool     `json:"scheduler"`
-	SchedulerAcrossPriorities bool     `json:"scheduler_across_priorities,omitempty"`
-	ModelRouter               bool     `json:"model_router"`
-	Executor                  bool     `json:"executor"`
-	RequestInterceptor        bool     `json:"request_interceptor"`
-	RequestLifecyclePlugin    bool     `json:"request_lifecycle_plugin"`
-	ExecutorModelScope        string   `json:"executor_model_scope"`
-	ExecutorInputFormats      []string `json:"executor_input_formats"`
-	ExecutorOutputFormats     []string `json:"executor_output_formats"`
+	Scheduler                        bool     `json:"scheduler"`
+	SchedulerAcrossPriorities        bool     `json:"scheduler_across_priorities,omitempty"`
+	ModelRouter                      bool     `json:"model_router"`
+	Executor                         bool     `json:"executor"`
+	RequestInterceptor               bool     `json:"request_interceptor"`
+	RequestInterceptorOmitBodyBefore bool     `json:"request_interceptor_omit_body_before,omitempty"`
+	RequestInterceptorOmitBodyAfter  bool     `json:"request_interceptor_omit_body_after,omitempty"`
+	RequestLifecyclePlugin           bool     `json:"request_lifecycle_plugin"`
+	ExecutorModelScope               string   `json:"executor_model_scope"`
+	ExecutorInputFormats             []string `json:"executor_input_formats"`
+	ExecutorOutputFormats            []string `json:"executor_output_formats"`
 }
 
 type rpcExecutorRequest struct {
@@ -194,6 +196,7 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 
 func pluginRegistration() registration {
 	schemaVersion := negotiatedSchemaVersion(hostSchemaVersion.Load())
+	defaults := defaultPluginConfig()
 	return registration{
 		SchemaVersion: schemaVersion,
 		Metadata: pluginapi.Metadata{
@@ -202,28 +205,30 @@ func pluginRegistration() registration {
 			Author:           "yueziji",
 			GitHubRepository: "https://github.com/yueziji/model-retry-wrapper-plugin",
 			ConfigFields: []pluginapi.ConfigField{
-				{Name: "models", Type: pluginapi.ConfigFieldTypeArray, Description: "Client-requested model names or aliases wrapped by this retry executor."},
-				{Name: "source_formats", Type: pluginapi.ConfigFieldTypeArray, Description: "Optional inbound protocol filter such as openai, openai-response, claude, or gemini."},
-				{Name: "status_codes", Type: pluginapi.ConfigFieldTypeArray, Description: "HTTP status codes retried inside the plugin before downstream delivery."},
-				{Name: "retry_keywords", Type: pluginapi.ConfigFieldTypeArray, Description: "Error substrings that allow retries even when the HTTP status does not match status_codes; an explicit empty list disables keyword retries."},
-				{Name: "max_attempts", Type: pluginapi.ConfigFieldTypeInteger, Description: "Maximum attempts, including the first try. 0 removes only the attempt-count cap."},
-				{Name: "same_auth_retries", Type: pluginapi.ConfigFieldTypeInteger, Description: "Extra attempts per credential per round, selecting available credentials by priority and starting a new round when exhausted. Total attempt/time limits apply across rounds. 0 keeps normal CPA selection. Requires this plugin to be the active scheduler; host cooldowns still apply."},
-				{Name: "initial_delay_ms", Type: pluginapi.ConfigFieldTypeInteger, Description: "Positive initial delay before a retry."},
-				{Name: "max_delay_ms", Type: pluginapi.ConfigFieldTypeInteger, Description: "Positive maximum exponential backoff delay."},
-				{Name: "max_elapsed_time_ms", Type: pluginapi.ConfigFieldTypeInteger, Description: "Wall-clock limit for one retry sequence. 0 removes the time limit."},
-				{Name: "model_overrides", Type: pluginapi.ConfigFieldTypeObject, Description: "Per-model retry overrides, keyed by the client-requested name or alias in models. Omitted fields inherit global settings; [] disables a list rule. Example: {\"retry-model\":{\"max_attempts\":3}}"},
+				{Name: "models", Type: pluginapi.ConfigFieldTypeArray, Default: []string{}, Description: "Client-requested model names or aliases wrapped by this retry executor."},
+				{Name: "source_formats", Type: pluginapi.ConfigFieldTypeArray, Default: []string{}, Description: "Optional inbound protocol filter such as openai, openai-response, claude, or gemini."},
+				{Name: "status_codes", Type: pluginapi.ConfigFieldTypeArray, Default: []int(defaults.StatusCodes), Description: "HTTP status codes retried inside the plugin before downstream delivery."},
+				{Name: "retry_keywords", Type: pluginapi.ConfigFieldTypeArray, Default: defaults.RetryKeywords, Description: "Error substrings that allow retries even when the HTTP status does not match status_codes; an explicit empty list disables keyword retries."},
+				{Name: "max_attempts", Type: pluginapi.ConfigFieldTypeInteger, Default: defaults.MaxAttempts, Description: "Maximum attempts, including the first try. 0 removes only the attempt-count cap."},
+				{Name: "same_auth_retries", Type: pluginapi.ConfigFieldTypeInteger, Default: defaults.SameAuthRetries, Description: "Extra attempts per credential per round, selecting available credentials by priority and starting a new round when exhausted. Total attempt/time limits apply across rounds. 0 keeps normal CPA selection. Requires this plugin to be the active scheduler; host cooldowns still apply."},
+				{Name: "initial_delay_ms", Type: pluginapi.ConfigFieldTypeInteger, Default: defaults.InitialDelayMS, Description: "Positive initial delay before a retry."},
+				{Name: "max_delay_ms", Type: pluginapi.ConfigFieldTypeInteger, Default: defaults.MaxDelayMS, Description: "Positive maximum exponential backoff delay."},
+				{Name: "max_elapsed_time_ms", Type: pluginapi.ConfigFieldTypeInteger, Default: defaults.MaxElapsedMS, Description: "Wall-clock limit for one retry sequence. 0 removes the time limit."},
+				{Name: "model_overrides", Type: pluginapi.ConfigFieldTypeObject, Default: map[string]any{}, Description: "Per-model retry overrides, keyed by the client-requested name or alias in models. Omitted fields inherit global settings; [] disables a list rule. Example: {\"retry-model\":{\"max_attempts\":3}}"},
 			},
 		},
 		Capabilities: registrationCapability{
-			Scheduler:                 credentialRetryEnabled(loadedConfig()),
-			SchedulerAcrossPriorities: credentialRetryEnabled(loadedConfig()),
-			ModelRouter:               true,
-			Executor:                  true,
-			RequestInterceptor:        lifecycleEventsSupported(schemaVersion),
-			RequestLifecyclePlugin:    lifecycleEventsSupported(schemaVersion),
-			ExecutorModelScope:        string(pluginapi.ExecutorModelScopeStatic),
-			ExecutorInputFormats:      supportedExecutorFormats(),
-			ExecutorOutputFormats:     supportedExecutorFormats(),
+			Scheduler:                        credentialRetryEnabled(loadedConfig()),
+			SchedulerAcrossPriorities:        credentialRetryEnabled(loadedConfig()),
+			ModelRouter:                      true,
+			Executor:                         true,
+			RequestInterceptor:               lifecycleEventsSupported(schemaVersion),
+			RequestInterceptorOmitBodyBefore: schemaVersion >= pluginabi.SchemaVersionRequestInterceptorOmitBody,
+			RequestInterceptorOmitBodyAfter:  schemaVersion >= pluginabi.SchemaVersionRequestInterceptorOmitBody,
+			RequestLifecyclePlugin:           lifecycleEventsSupported(schemaVersion),
+			ExecutorModelScope:               string(pluginapi.ExecutorModelScopeStatic),
+			ExecutorInputFormats:             supportedExecutorFormats(),
+			ExecutorOutputFormats:            supportedExecutorFormats(),
 		},
 	}
 }
@@ -583,6 +588,7 @@ func callHostModelExecute(req rpcExecutorRequest) (pluginapi.HostModelExecutionR
 			Body:          requestBody(req.ExecutorRequest),
 			Headers:       credentialRequestHeaders(req),
 			AuthID:        req.pinnedAuthID,
+			CallerScope:   requestCallerScope(req.ExecutorRequest),
 			Query:         cloneValues(req.Query),
 			Alt:           req.Alt,
 		},
@@ -611,6 +617,7 @@ func startHostModelStream(req rpcExecutorRequest) (int, []byte, string, error) {
 			Body:          requestBody(req.ExecutorRequest),
 			Headers:       credentialRequestHeaders(req),
 			AuthID:        req.pinnedAuthID,
+			CallerScope:   requestCallerScope(req.ExecutorRequest),
 			Query:         cloneValues(req.Query),
 			Alt:           req.Alt,
 		},

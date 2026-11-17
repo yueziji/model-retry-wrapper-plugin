@@ -13,8 +13,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginabi"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 	"gopkg.in/yaml.v3"
 )
 
@@ -394,6 +394,13 @@ func requestBody(req pluginapi.ExecutorRequest) []byte {
 		return append([]byte(nil), req.OriginalRequest...)
 	}
 	return append([]byte(nil), req.Payload...)
+}
+
+// The host supplies an opaque caller handle in executor metadata. Preserve it
+// across nested executions so caller-scoped sessions and tool aliases stay stable.
+func requestCallerScope(req pluginapi.ExecutorRequest) string {
+	scope, _ := req.Metadata[pluginapi.CallerScopeMetadataKey].(string)
+	return strings.TrimSpace(scope)
 }
 
 func entryProtocol(req pluginapi.ExecutorRequest) string {

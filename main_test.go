@@ -12,8 +12,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginabi"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 )
 
 func TestShouldRouteMatchesConfiguredModelAlias(t *testing.T) {
@@ -445,6 +445,10 @@ func TestNegotiatedSchemaVersionCapsAtPluginSupport(t *testing.T) {
 		{host: 4, want: 4},
 		{host: 5, want: 5},
 		{host: 6, want: 6},
+		{host: 7, want: 7},
+		{host: 8, want: 8},
+		{host: 9, want: 9},
+		{host: 10, want: 10},
 		{host: 99, want: pluginabi.SchemaVersion},
 	}
 	for _, tt := range tests {
@@ -470,7 +474,7 @@ func TestRegistrationGatesLifecycleCapabilityOnSchemaVersion(t *testing.T) {
 		t.Fatal("request_interceptor advertised to a schema-1 host")
 	}
 
-	for _, schema := range []uint32{2, 3, 4, 5, 6} {
+	for _, schema := range []uint32{2, 3, 4, 5, 6, 7, 8, 9, 10} {
 		hostSchemaVersion.Store(schema)
 		reg = pluginRegistration()
 		if reg.SchemaVersion != schema {
